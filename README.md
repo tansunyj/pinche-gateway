@@ -5,6 +5,18 @@
 - 技术栈：Spring Boot 3.3.4 + WebFlux（全链路响应式非阻塞）、Java 21、R2DBC MySQL、Redis Reactive、Log4j2
 - 依赖：本机 MySQL（库 `pt_carpool`）+ Redis（localhost:6379）
 
+## 相关仓库
+
+本平台共分 **3 个子项目**，各对应一个独立 Git 仓库：
+
+| 子项目（GitHub 仓库名） | 说明 | Git 地址 |
+| ------ | ---- | -------- |
+| `pinche-frontend` | 前端 | `https://github.com/tansunyj/pinche-frontend.git` |
+| `pinche-backend` | 后端服务 | `https://github.com/tansunyj/pinche-backend.git` |
+| `pinche-gateway` | 网关代理 | `https://github.com/tansunyj/pinche-gateway.git` |
+
+> 本仓库是其中的 **`pinche-gateway`（网关代理）** 子项目（本地目录 `gateway`）。三个仓库相互独立，需分别 `git clone` / `git push`；跨仓库协作时各自独立提交、互不影响。
+
 ## 构建与运行
 
 ```bash
