@@ -1,0 +1,76 @@
+# ============================================================
+# Silievo 多协议 LLM 网关 - 主配置模板（公共/通用配置）
+# 【使用方法】复制本文件为 application.yml 并填入真实密钥：
+#     cp application.yml.example application.yml        # Linux / macOS
+#     Copy-Item application.yml.example application.yml # Windows PowerShell
+# 【安全说明】application.yml 含真实密钥，已 gitignore，禁止提交 GitHub。
+#   也可以不写死密钥，改用环境变量注入（Spring 会解析 ${OSS_ACCESS_KEY_ID}）：
+#     oss.access-key-id      = ${OSS_ACCESS_KEY_ID}
+#     oss.access-key-secret  = ${OSS_ACCESS_KEY_SECRET}
+# ============================================================
+
+spring:
+  profiles:
+    # 默认激活 dev：直接 java -jar 即以开发环境启动
+    active: dev
+
+  application:
+    name: silievo-gateway
+
+  codec:
+    # 调大内存缓冲区（30MB），防止大模型返回超长文本或多模态大图片 Base64 时报 DataBufferLimitException
+    max-in-memory-size: 30MB
+
+  jackson:
+    # 统一全局序列化行为：忽略 null 字段，保证返回给 OpenAI/Anthropic SDK 的 JSON 干净不报错
+    default-property-inclusion: non_null
+
+  # ====== R2DBC 数据库配置（url/username/password 按环境在 profile 中覆盖）======
+  r2dbc:
+    pool:
+      enabled: true
+      initial-size: 5
+      max-size: 20
+      max-idle-time: 30m
+      max-life-time: 0
+
+  # ====== Redis 配置（host/port/password/database 按环境在 profile 中覆盖）======
+  data:
+    redis:
+      timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 0
+          max-wait: 1000ms
+
+# ====== 服务器配置（端口按环境在 profile 中覆盖）======
+server:
+  # 优化 Netty 反应式服务器的资源配置
+  netty:
+    connection-timeout: 30000ms
+  # 禁用 HTTP/2，强制使用 HTTP/1.1，避免多路复用导致响应交错写入
+  http2:
+    enabled: false
+
+# ====== 阿里云 OSS 配置（生图 base64→URL）======
+# AccessKey 请填真实值，或用环境变量占位：${OSS_ACCESS_KEY_ID} / ${OSS_ACCESS_KEY_SECRET}
+oss:
+  region: oss-cn-shenzhen
+  bucket: your-bucket
+  access-key-id: ${OSS_ACCESS_KEY_ID}
+  access-key-secret: ${OSS_ACCESS_KEY_SECRET}
+  cdn-base-url: https://your-bucket.oss-cn-shenzhen.aliyuncs.com
+  sign-ttl-seconds: 3600
+
+# 日志级别（开发默认 DEBUG 调试，生产在 profile 中降为 INFO/WARN）
+logging:
+  level:
+    root: INFO
+    com.llmate.multiprotocol: DEBUG
+    org.springframework.web.reactive: INFO
+    io.projectreactor.netty: INFO
+    # r2dbc-mysql 驱动：MySQL 断开池内空闲连接时打 WARN "Connection unexpectedly closed"（环境侧 socket 被断开，
+    # 连接池自动重连自愈，本地 MySQL wait_timeout=8h 已排除服务端超时因素）。降为 ERROR 消除启动期噪音，真实连接故障仍会报错
+    io.asyncer.r2dbc.mysql: ERROR

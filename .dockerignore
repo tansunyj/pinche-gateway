@@ -1,0 +1,17 @@
+node_modules
+target
+logs
+docs
+requirements
+web
+server
+silievo-site
+__MACOSX
+*.zip
+*.jar.*
+.DS_Store
+.git
+Dockerfile
+.dockerignore
+start-cn.sh
+start-intl.sh

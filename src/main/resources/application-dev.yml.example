@@ -1,0 +1,29 @@
+# ============================================================
+# Silievo 多协议 LLM 网关 - 开发环境配置模板
+# 【使用方法】复制本文件为 application-dev.yml 并填入本地数据库密码：
+#     cp application-dev.yml.example application-dev.yml        # Linux / macOS
+#     Copy-Item application-dev.yml.example application-dev.yml # Windows PowerShell
+# 【安全说明】application-dev.yml 含本地真实凭据，已 gitignore，禁止提交 GitHub。
+# ============================================================
+spring:
+  config:
+    activate:
+      on-profile: dev
+
+  # ====== 本地 MySQL（R2DBC）======
+  r2dbc:
+    url: r2dbc:mysql://localhost:3306/pt_carpool?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai
+    username: root
+    password: "change-me"          # 本地 MySQL root 密码
+
+  # ====== 本地 Redis（无密码）======
+  data:
+    redis:
+      host: localhost
+      port: 6379
+      password:          # 无密码时留空
+      database: 1
+
+# ====== 服务器端口 ======
+server:
+  port: 3003
