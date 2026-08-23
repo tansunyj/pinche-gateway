@@ -217,7 +217,7 @@ public class BillingService {
      * 与 {@link #settleNonStream} 的区别：不依赖 LlmChatResponse，直接用 UsageData
      * （向量响应是透传 JSON，usage 由 EmbeddingService 解析为 UsageData）。
      */
-    public Mono<Void> settleEmbedding(BillingContext ctx, UsageData usageData, long latency, String responseBodyJson) {
+    public Mono<Void> settleEmbedding(BillingContext ctx, UsageData usageData, long latency) {
         String upstreamModel = ctx.getRouting().getUpstreamModel();
 
         return buildBillingParams(ctx.getPriceConfig(), ctx.getTokenEntity(), upstreamModel, ctx.getRouting().getModelId())
@@ -241,7 +241,7 @@ public class BillingService {
                     ctx.getRequestId(), ctx.getUserId(), ctx.getTokenId(), ctx.getTokenEntity(),
                     ctx.getRouting(), usageData, costResult, latency, "success");
                 settlementService.recordEmbeddingRequestLogComplete(
-                    ctx.getRequestId(), usageData, costResult, latency, 200, responseBodyJson, null);
+                    ctx.getRequestId(), usageData, costResult, latency, 200, null);
                 // 记录统计
                 recordStats(ctx, usageData, costResult, latency, true, "embedding");
                 log.info("[BillingService] 向量结算完成: requestId={}, latency={}ms, quota={}",

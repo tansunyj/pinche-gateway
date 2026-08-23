@@ -89,8 +89,6 @@ public class ProxyLogsEntity {
     @Column("aborted")
     private Integer aborted;
 
-    // ==================== 请求/响应审计字段（原 proxy_request_logs 并入） ====================
-
     /**
      * 请求方法
      */
@@ -104,46 +102,10 @@ public class ProxyLogsEntity {
     private String requestPath;
 
     /**
-     * 请求头（JSON）
-     */
-    @Column("request_headers")
-    private String requestHeaders;
-
-    /**
-     * 请求体
-     */
-    @Column("request_body")
-    private String requestBody;
-
-    /**
-     * 请求大小（字节）
-     */
-    @Column("request_size_bytes")
-    private Integer requestSizeBytes;
-
-    /**
      * 响应状态码
      */
     @Column("response_status")
     private Integer responseStatus;
-
-    /**
-     * 响应头（JSON）
-     */
-    @Column("response_headers")
-    private String responseHeaders;
-
-    /**
-     * 响应体
-     */
-    @Column("response_body")
-    private String responseBody;
-
-    /**
-     * 响应大小（字节）
-     */
-    @Column("response_size_bytes")
-    private Integer responseSizeBytes;
 
     /**
      * 是否流式
@@ -165,12 +127,6 @@ public class ProxyLogsEntity {
 
     @Column("total_tokens")
     private Integer totalTokens;
-
-    /**
-     * 错误代码
-     */
-    @Column("error_code")
-    private String errorCode;
 
     /**
      * 客户端IP

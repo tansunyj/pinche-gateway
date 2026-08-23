@@ -9,6 +9,7 @@ import lombok.extern.log4j.Log4j2;
 import java.math.BigDecimal;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 增强日志工具类
@@ -49,14 +50,20 @@ public class LogBox {
     }
 
     /**
-     * 请求入口日志（HTTP 请求，==== 框起，请求体完整打印）
+     * 请求入口日志（HTTP 请求，==== 框起，脱敏请求头 + 请求大小 + 请求体完整打印）。
+     *
+     * @param headers   脱敏后的请求头 Map（authorization/x-api-key/api-key 已置 "***"），可为 null
+     * @param sizeBytes 请求大小（UTF-8 字节），未知传 null
      */
-    public static void logRequestEntry(String method, String path, String requestId, Long userId, Object body) {
+    public static void logRequestEntry(String method, String path, String requestId, Long userId,
+                                       Map<String, String> headers, Integer sizeBytes, Object body) {
         StringBuilder sb = frameStart("请求入口");
         sb.append("RequestId: ").append(requestId != null ? requestId : "N/A").append("\n");
         sb.append("UserId: ").append(userId != null ? userId : "N/A").append("\n");
         sb.append("Method: ").append(method).append("\n");
         sb.append("Path: ").append(path).append("\n");
+        appendHeaders(sb, "Request Headers", headers);
+        sb.append("Request Size: ").append(sizeBytes != null ? sizeBytes : "N/A").append(" bytes\n");
         appendBody(sb, "Body", body);
         logFrame(sb);
     }
@@ -64,10 +71,14 @@ public class LogBox {
     /**
      * 请求响应日志。
      *
-     * @param isStream 是否流式(SSE)响应：是 → 不加 ==== 框，完整打印 SSE 原文；
-     *                 否 → ==== 框起，响应体完整打印。
+     * @param headers   真实响应头 Map，可为 null
+     * @param sizeBytes 响应大小（字节），未知传 null
+     * @param isStream  是否流式(SSE)响应：是 → 不加 ==== 框，完整打印 SSE 原文；
+     *                  否 → ==== 框起，响应体完整打印。
      */
-    public static void logRequestResponse(String requestId, Long userId, long durationMs, Object body, boolean isStream) {
+    public static void logRequestResponse(String requestId, Long userId, long durationMs,
+                                          Map<String, String> headers, Integer sizeBytes,
+                                          Object body, boolean isStream) {
         if (isStream) {
             // 流式响应：不用 ==== 框，完整打印 SSE 响应体原文
             StringBuilder sb = new StringBuilder();
@@ -75,6 +86,8 @@ public class LogBox {
             sb.append("【请求响应】RequestId: ").append(requestId != null ? requestId : "N/A")
               .append(", UserId: ").append(userId != null ? userId : "N/A")
               .append(", Duration: ").append(durationMs).append("ms, Type: text/event-stream\n");
+            appendHeaders(sb, "Response Headers", headers);
+            sb.append("Response Size: ").append(sizeBytes != null ? sizeBytes : "N/A").append(" bytes\n");
             appendBody(sb, "Body", body);
             log.info(sb.toString());
         } else {
@@ -82,6 +95,8 @@ public class LogBox {
             sb.append("RequestId: ").append(requestId != null ? requestId : "N/A").append("\n");
             sb.append("UserId: ").append(userId != null ? userId : "N/A").append("\n");
             sb.append("Duration: ").append(durationMs).append("ms\n");
+            appendHeaders(sb, "Response Headers", headers);
+            sb.append("Response Size: ").append(sizeBytes != null ? sizeBytes : "N/A").append(" bytes\n");
             appendBody(sb, "Body", body);
             logFrame(sb);
         }
@@ -369,6 +384,18 @@ public class LogBox {
     }
 
     // ==================== 内部工具方法 ====================
+
+    /**
+     * 追加 Header 内容行：逐行 "  Key: Value" 打印；空/null 打 "(none)"。
+     */
+    private static void appendHeaders(StringBuilder sb, String label, Map<String, String> headers) {
+        sb.append(label).append(":\n");
+        if (headers == null || headers.isEmpty()) {
+            sb.append("  (none)\n");
+            return;
+        }
+        headers.forEach((key, value) -> sb.append("  ").append(key).append(": ").append(value).append("\n"));
+    }
 
     /**
      * 追加 Body 内容行：String 原样完整打印；对象序列化为 JSON 完整打印。不做任何截断。

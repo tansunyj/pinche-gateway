@@ -1,7 +1,6 @@
 package com.llmate.multiprotocol.service;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 import com.llmate.multiprotocol.constant.BusinessConstants;
 import com.llmate.multiprotocol.constant.SystemConstants;
 import com.llmate.multiprotocol.dto.BillingContext;
@@ -59,7 +58,6 @@ public class EmbeddingService {
     private final ProxyChannelTokensRepository proxyChannelTokensRepository;
     private final BillingService billingService;
     private final SettlementService settlementService;
-    private final ObjectMapper objectMapper;
     private final WebClient webClient;
 
     public EmbeddingService(ModelEndpointResolver modelEndpointResolver,
@@ -67,14 +65,12 @@ public class EmbeddingService {
                             ProxyChannelTokensRepository proxyChannelTokensRepository,
                             BillingService billingService,
                             SettlementService settlementService,
-                            ObjectMapper objectMapper,
                             WebClient.Builder webClientBuilder) {
         this.modelEndpointResolver = modelEndpointResolver;
         this.proxyChannelsRepository = proxyChannelsRepository;
         this.proxyChannelTokensRepository = proxyChannelTokensRepository;
         this.billingService = billingService;
         this.settlementService = settlementService;
-        this.objectMapper = objectMapper;
         // 使用 ConnectionProvider.newConnection() 禁用连接池，每次请求新建 TCP+TLS 连接。
         // 国内服务器出站经阿里云 NAT，NAT 空闲超时后会断开池中旧连接，Reactor Netty 默认
         // DefaultPooledConnectionProvider 不知情，拿出来复用 → Connection reset by peer
@@ -126,7 +122,6 @@ public class EmbeddingService {
 
         String pureModelId = pureModelId(modelId);
         boolean hasChannelPrefix = modelId != null && modelId.contains("/");
-        String requestBodyJson = serialize(clientRequest);
 
         log.info("[Embedding] 请求开始: model={}, pureModelId={}, requestId={}", modelId, pureModelId, requestId);
 
@@ -159,7 +154,7 @@ public class EmbeddingService {
                             .flatMap(reserved -> {
                                 // 4. 记录请求日志（开始）
                                 settlementService.recordEmbeddingRequestLogStart(
-                                        requestId, userId, tokenId, routing, requestPath, requestBodyJson, exchange);
+                                        requestId, userId, tokenId, routing, requestPath, exchange);
 
                                 // 5. 调上游并透传
                                 Map<String, Object> upstreamBody = bodyBuilder.apply(pureModelId);
@@ -172,7 +167,7 @@ public class EmbeddingService {
                                         //    向量费用来源（价格/用量）完整可见。结算失败不阻塞响应返回。
                                         UsageData usageData = parseUsage(response, isTextEmbedding);
                                         return billingService.settleEmbedding(
-                                                    billingContext, usageData, latency, response.toString())
+                                                    billingContext, usageData, latency)
                                                 .onErrorResume(e -> {
                                                     log.error("[Embedding] 结算异常但响应仍返回: requestId={}, err={}",
                                                             requestId, e.getMessage());
@@ -382,15 +377,6 @@ public class EmbeddingService {
             return modelId;
         }
         return modelId.substring(modelId.indexOf('/') + 1);
-    }
-
-    private String serialize(Object obj) {
-        try {
-            return objectMapper.writeValueAsString(obj);
-        } catch (Exception e) {
-            log.warn("[Embedding] 序列化请求体失败", e);
-            return null;
-        }
     }
 
     /**

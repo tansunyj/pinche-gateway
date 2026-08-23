@@ -139,7 +139,7 @@ public class LlmGateway {
                                 billingService.reserve(userId, requestId, priceConfig)
                                     .flatMap(reservedBalance -> {
                                         // 3. 记录请求开始日志（同步操作，不阻塞）
-                                        settlementService.recordRequestLogStart(requestId, userId, tokenId, routing, internalRequest, isStream, exchange);
+                                        settlementService.recordRequestLogStart(requestId, userId, tokenId, routing, isStream, exchange);
 
                                         // 4. 解析端点配置
                                         return resolveEndpointConfig(routing.getUpstreamModel(), routing.getChannelId())
@@ -301,7 +301,7 @@ public class LlmGateway {
                         return billingService.reserve(context.userId, requestId, priceConfig)
                             .flatMapMany(reservedBalance -> {
                                 // 关键修复：之前误传 null 导致流式请求的 request_headers/client_ip/user_agent 全部落空
-                                settlementService.recordRequestLogStart(requestId, context.userId, context.tokenId, routing, internalRequest, true, exchange);
+                                settlementService.recordRequestLogStart(requestId, context.userId, context.tokenId, routing, true, exchange);
 
                                 return resolveEndpointConfig(routing.getUpstreamModel(), routing.getChannelId())
                                     .flatMapMany(endpointConfig -> {

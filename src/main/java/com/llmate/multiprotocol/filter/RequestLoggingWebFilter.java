@@ -2,8 +2,6 @@ package com.llmate.multiprotocol.filter;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.llmate.multiprotocol.constant.SystemConstants;
-import com.llmate.multiprotocol.engine.LlmGateway;
-import com.llmate.multiprotocol.service.SettlementService;
 import com.llmate.multiprotocol.util.LogBox;
 import com.llmate.multiprotocol.util.UserContext;
 import lombok.extern.log4j.Log4j2;
@@ -27,6 +25,8 @@ import reactor.core.publisher.Mono;
 
 import java.io.ByteArrayOutputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.LinkedHashMap;
+import java.util.Map;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -40,24 +40,15 @@ import java.util.concurrent.atomic.AtomicLong;
 @Log4j2
 public class RequestLoggingWebFilter implements WebFilter {
 
-    /**
-     * 原始请求体在 exchange 属性中的键。
-     * 非 multipart 请求在过滤器预读 body 时缓存到这里，SettlementService 用它写
-     * proxy_request_logs.request_body（保存客户端原始上报数据，而非内部业务对象）。
-     */
-    public static final String REQUEST_BODY_ATTR = "rawRequestBody";
-
     private final ObjectMapper objectMapper;
-    private final SettlementService settlementService;
 
-    public RequestLoggingWebFilter(SettlementService settlementService, ObjectMapper objectMapper) {
-        this.settlementService = settlementService;
+    public RequestLoggingWebFilter(ObjectMapper objectMapper) {
         // 注入 Spring 单例 ObjectMapper，不各自 new 一份
         this.objectMapper = objectMapper;
     }
 
     // 注意：不再设置任何响应体捕获/显示上限 —— HTTP 请求、HTTP 应答、SSE 响应体必须
-    // 完整、详细地打印到日志并写入 proxy_request_logs（response_body 是 longtext，存得下）。
+    // 完整、详细地打印到网关日志（logs/gateway.log）。DB 已不再存储请求/应答数据。
     // 捕获的字节在响应写完前驻留内存，体量等于响应本身，这是完整记录的必要代价。
 
     @Override
@@ -111,7 +102,9 @@ public class RequestLoggingWebFilter implements WebFilter {
             String entryBody = contentLength >= 0
                     ? "(multipart/form-data, " + contentLength + " bytes)"
                     : "(multipart/form-data, chunked)";
-            LogBox.logRequestEntry(method, path, requestId, userId, entryBody);
+            Integer requestSizeBytes = contentLength >= 0 ? (int) contentLength : null;
+            LogBox.logRequestEntry(method, path, requestId, userId,
+                    maskedRequestHeaders(request), requestSizeBytes, entryBody);
 
             ServerWebExchange mutatedExchange = exchange.mutate().response(decoratedResponse).build();
             // 链只执行一次。requestId 已由 RequestIdWebFilter 写入 Reactor Context（最外层算子），
@@ -134,15 +127,12 @@ public class RequestLoggingWebFilter implements WebFilter {
 
                 String requestBody = new String(bytes, StandardCharsets.UTF_8);
 
-                // 缓存原始请求体到 exchange 属性，供 SettlementService 写入 proxy_request_logs.request_body
-                //（存客户端原始上报数据，而不是内部 LlmChatRequest 重建体）
-                exchange.getAttributes().put(REQUEST_BODY_ATTR, requestBody);
-
                 // 输出带方框的请求入口日志（空请求体也在此统一处理）。
                 // 说明：请求入口日志发生在认证之后（见过滤器顺序），此时 UserContext 已带上 userId。
                 Long userId = UserContext.getUserId(exchange);
                 String entryBody = requestBody.isEmpty() ? "(no body)" : prettyJson(requestBody);
-                LogBox.logRequestEntry(method, path, requestId, userId, entryBody);
+                LogBox.logRequestEntry(method, path, requestId, userId,
+                        maskedRequestHeaders(request), requestBody.getBytes(StandardCharsets.UTF_8).length, entryBody);
 
                 // 包装请求，使后续 filter 可以重新读取 body
                 ServerHttpRequest decoratedRequest = new ServerHttpRequestDecorator(request) {
@@ -165,7 +155,8 @@ public class RequestLoggingWebFilter implements WebFilter {
 
     /**
      * 响应完成后的统一日志（两个分支共用）：非流式 ==== 框 + 完整 JSON 美化体；
-     * 流式(SSE)原文输出（不加框）+ 把真实响应体回填 proxy_request_logs。requestId 用网关生成的 id。
+     * 流式(SSE)原文输出（不加框）。requestId 用网关生成的 id。
+     * DB 已不再存储请求/应答数据，响应头/大小/正文全部完整打印到网关日志。
      */
     private void logResponse(ServerWebExchange exchange, String requestId, long startTime,
                              ByteArrayOutputStream responseBodyStream, AtomicLong totalResponseBytes) {
@@ -177,20 +168,15 @@ public class RequestLoggingWebFilter implements WebFilter {
             long duration = System.currentTimeMillis() - startTime;
             String responseBody = responseBodyStream.toString(StandardCharsets.UTF_8);
 
-            String gatewayRequestId = exchange.getAttribute(LlmGateway.REQUEST_ID_ATTR);
             boolean isStream = isEventStreamResponse(exchange.getResponse());
             Long responseUserId = UserContext.getUserId(exchange);
             LogBox.logRequestResponse(requestId, responseUserId, duration,
+                responseHeadersToMap(exchange.getResponse()),
+                (int) totalResponseBytes.get(),
                 responseBody.isEmpty()
                     ? "(empty body/stream response)"
                     : (isStream ? responseBody : prettyJson(responseBody)),
                 isStream);
-
-            // 流式(SSE)响应：把真实响应体回填到 proxy_request_logs（部分更新，仅覆盖 body/size 两列）
-            if (gatewayRequestId != null && isStream) {
-                settlementService.recordStreamResponseBody(
-                    gatewayRequestId, responseBody, (int) totalResponseBytes.get());
-            }
         } finally {
             ThreadContext.remove(SystemConstants.CONTEXT_REQUEST_ID_KEY);
         }
@@ -221,11 +207,37 @@ public class RequestLoggingWebFilter implements WebFilter {
     }
 
     /**
-     * 将响应体字节完整写入捕获流（不截断）。日志与 proxy_request_logs 都要完整记录 HTTP 应答，
+     * 将响应体字节完整写入捕获流（不截断）。日志要完整记录 HTTP 应答，
      * 响应体字节在响应写完前驻留内存（等于响应本身大小），这是完整记录的必要代价。
      */
     private void captureBodySafely(ByteArrayOutputStream stream, byte[] buf) {
         stream.write(buf, 0, buf.length);
+    }
+
+    /**
+     * 请求头脱敏转 Map，供入口日志打印。authorization / x-api-key / api-key 值一律置 "***"，
+     * 其余头原样输出（key 统一小写）。空头返回空 Map。
+     */
+    private Map<String, String> maskedRequestHeaders(ServerHttpRequest request) {
+        Map<String, String> result = new LinkedHashMap<>();
+        request.getHeaders().forEach((name, values) -> {
+            String lower = name.toLowerCase();
+            String value = lower.equals("authorization")
+                    || lower.equals("x-api-key")
+                    || lower.equals("api-key")
+                    ? "***" : String.join(", ", values);
+            result.put(name, value);
+        });
+        return result;
+    }
+
+    /**
+     * 响应头转 Map，供响应日志打印。key 统一小写，多值用 ", " 拼接。
+     */
+    private Map<String, String> responseHeadersToMap(ServerHttpResponse response) {
+        Map<String, String> result = new LinkedHashMap<>();
+        response.getHeaders().forEach((name, values) -> result.put(name, String.join(", ", values)));
+        return result;
     }
 
     /**
