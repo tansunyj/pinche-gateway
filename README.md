@@ -22,7 +22,7 @@
 ```bash
 mvn clean compile                  # 编译
 mvn clean package -DskipTests      # 打包
-java -jar target/silievo-api-gateway-service-1.0-SNAPSHOT.jar   # 运行（默认 dev 环境，端口 3003）
+java -jar target/pinche-gateway-1.0-SNAPSHOT.jar   # 运行（默认 dev 环境，端口 3003）
 ```
 
 > 注意：网关 jar 必须在**终端前台**运行（本机 360 安全卫士会杀后台启动的 java 进程）。
@@ -35,14 +35,17 @@ java -jar target/silievo-api-gateway-service-1.0-SNAPSHOT.jar   # 运行（默�
 |---|---|
 | `src/main/resources/application.yml` | `src/main/resources/application.yml.example` |
 | `src/main/resources/application-dev.yml` | `src/main/resources/application-dev.yml.example` |
+| `src/main/resources/application-prod.yml` | `src/main/resources/application-prod.yml.example` |
 
 **首次克隆 / 全新环境**：从模板生成本地配置文件，并填入你自己的真实值：
 
 ```powershell
 Copy-Item src/main/resources/application.yml.example src/main/resources/application.yml
 Copy-Item src/main/resources/application-dev.yml.example src/main/resources/application-dev.yml
-# 编辑 application.yml       → 填入 OSS AccessKey / AccessKeySecret、Bucket、CDN 域名
-# 编辑 application-dev.yml  → 填入本地 MySQL root 密码
+Copy-Item src/main/resources/application-prod.yml.example src/main/resources/application-prod.yml   # 生产环境
+# 编辑 application.yml                → 填入 OSS AccessKey / AccessKeySecret、Bucket、CDN 域名
+# 编辑 application-dev.yml           → 填入本地 MySQL root 密码
+# 编辑 application-prod.yml          → 填入生产 MySQL 密码 / Redis 密码 / 库号
 ```
 
 ### 需要配置的密钥项
@@ -69,8 +72,85 @@ oss:
 
 ```powershell
 $env:OSS_ACCESS_KEY_ID='你的AK'; $env:OSS_ACCESS_KEY_SECRET='你的SK'; $env:MYSQL_PASSWORD='123456'
-java -jar target/silievo-api-gateway-service-1.0-SNAPSHOT.jar
+java -jar target/pinche-gateway-1.0-SNAPSHOT.jar
 ```
+
+## 生产部署（Linux 服务器）
+
+网关通过 Maven profile `prod` 运行（与 Dockerfile 的 `SPRING_PROFILES_ACTIVE=prod` 一致）。
+
+### 1. 准备配置文件
+
+| 本地真实文件（gitignore，不上传） | 仓库上传的模板 |
+|---|---|
+| `src/main/resources/application.yml` | `src/main/resources/application.yml.example` |
+| `src/main/resources/application-prod.yml` | `src/main/resources/application-prod.yml.example` |
+
+```bash
+cp src/main/resources/application-prod.yml.example src/main/resources/application-prod.yml
+# 编辑 application-prod.yml → 填入 MYSQL_PASSWORD、REDIS_PASSWORD（无则留空）、REDIS_DB
+# application.yml（含真实 OSS 密钥）也需一并部署，与生产 profile 共用
+```
+
+**⚠️ Redis 库号必须与后端 `.env.docker` 的 REDIS_URL 一致**——网关余额缓存 `user:balance:{userId}` 与后端共用实例，库号不一致会导致后端读到旧值。
+
+### 2. 构建与启动
+
+**部署流程**：本地构建 jar → 上传 jar + 真实配置到服务器 → 服务器上重启：
+
+```bash
+# 本地构建
+mvn package -DskipTests
+
+# 上传到服务器（示例，按实际路径改）
+#   target/pinche-gateway-1.0-SNAPSHOT.jar
+#   src/main/resources/application.yml（含真实 OSS 密钥）
+#   src/main/resources/application-prod.yml（已填真实值）
+
+# 服务器上重启（停旧 → prod 后台启动 → /health 探活，端口 3003）
+sh restart.sh
+# 本地调试：sh restart.sh dev
+```
+
+- 服务器只需 JDK 21（`java -version` 可查），无需 Maven
+- 也可用环境变量注入密钥（覆盖 yml 里的 `${...}`）：`MYSQL_PASSWORD=xxx sh restart.sh`
+- 健康检查：`curl http://127.0.0.1:3003/health`
+- 日志：`logs/gateway.log`（前台调试：`java -jar target/pinche-gateway-1.0-SNAPSHOT.jar`，默认 dev 环境）
+
+**更稳的生产方式（推荐）：systemd 托管**，服务器重启自动拉起、崩溃自动重启：
+
+```bash
+# 1. 部署到固定目录（jar + application.yml + application-prod.yml）
+sudo mkdir -p /opt/silievo-gateway
+sudo cp target/pinche-gateway-1.0-SNAPSHOT.jar /opt/silievo-gateway/
+sudo cp src/main/resources/application*.yml /opt/silievo-gateway/
+# 2. 安装服务单元（仓库根目录已有 silievo-gateway.service，路径默认 /opt/silievo-gateway）
+sudo cp silievo-gateway.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now silievo-gateway
+# 常用命令
+systemctl status silievo-gateway
+journalctl -u silievo-gateway -f
+sudo systemctl restart silievo-gateway
+```
+
+### 3. 反向代理（nginx）
+
+网关与 MySQL/Redis 同机，直接连 `127.0.0.1`。对外经 nginx 反代：
+
+```nginx
+location / {
+    proxy_pass http://127.0.0.1:3003;
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_read_timeout 120s;
+}
+```
+
+> 若走 Docker 部署：`docker compose -f docker-deploy/docker-compose.yml build gateway` 前需先把构建好的 jar 放到 `gateway/` 目录（Dockerfile 直接 COPY 预构建 jar）。
 
 ## 主要端点
 

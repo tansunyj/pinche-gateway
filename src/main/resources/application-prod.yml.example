@@ -1,0 +1,44 @@
+# ============================================================
+# Silievo 多协议 LLM 网关 - 生产环境配置模板（prod）
+# 【使用方法】复制本文件为 application-prod.yml 并填入生产密钥：
+#     cp application-prod.yml.example application-prod.yml   # Linux
+# 【安全说明】application-prod.yml 含生产真实凭据，已 gitignore，
+#   禁止提交 GitHub。仓库只上传本 .example 模板。
+#   推荐做法：密钥用 ${ENV_VAR} 占位，启动时经 .env.prod（gitignored）
+#   或 systemd EnvironmentFile 注入，不要在 yml 里写死。
+# ============================================================
+spring:
+  config:
+    activate:
+      on-profile: prod
+
+  # ====== 生产 MySQL（R2DBC）======
+  # 服务器 MySQL 只监听 127.0.0.1:3306，网关与后端同机 → 直连 127.0.0.1。
+  # 若网关改用 Docker bridge 网络（非 host），此地址需换成宿主机实际 IP 或 extra_hosts。
+  r2dbc:
+    url: r2dbc:mysql://127.0.0.1:3306/pt_carpool?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai
+    username: ${MYSQL_USER:silievo}
+    password: ${MYSQL_PASSWORD}
+
+  # ====== 生产 Redis（与后端共用实例）======
+  data:
+    redis:
+      host: ${REDIS_HOST:127.0.0.1}
+      port: ${REDIS_PORT:6379}
+      password: ${REDIS_PASSWORD:}
+      # ⚠️ 库号必须与后端 .env.docker 的 REDIS_URL 一致：
+      #    网关余额缓存 key user:balance:{userId} 与后端共用实例，
+      #    库号不一致会导致后端读不到网关写的缓存（10min TTL 旧值问题）。
+      database: ${REDIS_DB:0}
+
+# ====== 服务器端口 ======
+server:
+  port: 3003
+
+# 生产日志：root INFO，业务日志从 DEBUG 降为 INFO；r2dbc 驱动连接被断开时降噪
+logging:
+  level:
+    com.llmate.multiprotocol: INFO
+    org.springframework.web.reactive: INFO
+    io.projectreactor.netty: INFO
+    io.asyncer.r2dbc.mysql: ERROR

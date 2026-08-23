@@ -103,6 +103,8 @@
   </dependencies>
 
   <build>
+    <!-- 产物 jar 文件名：pinche-gateway-1.0-SNAPSHOT.jar（finalName 不含 .jar 后缀） -->
+    <finalName>pinche-gateway-${project.version}</finalName>
     <plugins>
       <plugin>
         <groupId>org.apache.maven.plugins</groupId>
@@ -123,7 +125,7 @@
         <configuration>
           <!-- 把当前激活的 Maven profile 对应的 Spring profile 传给 spring-boot:run
                （作为 spring.profiles.active 启动参数，命令行长横线前缀两个）：
-               dev / prod-cn / prod-intl 在下方 profiles 中定义。
+               dev / prod 在下方 profiles 中定义。
                IDEA 中：Maven 工具窗口 - Profiles 勾选环境后运行 spring-boot:run 即按所选环境启动。 -->
           <profiles>
             <profile>${profile.active}</profile>
@@ -137,6 +139,7 @@
        多环境 Maven profiles（对应 src/main/resources/application-*.yml）
        IDEA Maven 工具窗口 - Profiles 勾选切换，再运行 spring-boot:run 即按所选环境启动：
          dev        开发环境（默认激活；勾选其他 profile 后 dev 自动取消）
+         prod       生产环境（配置见 application-prod.yml，真实文件 gitignored）
        ============================================================ -->
   <profiles>
     <profile>
@@ -146,6 +149,13 @@
       </activation>
       <properties>
         <profile.active>dev</profile.active>
+      </properties>
+    </profile>
+
+    <profile>
+      <id>prod</id>
+      <properties>
+        <profile.active>prod</profile.active>
       </properties>
     </profile>
 

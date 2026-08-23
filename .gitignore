@@ -46,6 +46,8 @@ run-dev.ps1
 ### Local real config (contains real credentials — never upload; upload the *.example templates instead) ###
 src/main/resources/application.yml
 src/main/resources/application-dev.yml
+src/main/resources/application-prod.yml
+src/main/resources/application-prod-intl.yml
 
 ### Python caches ###
 __pycache__/
