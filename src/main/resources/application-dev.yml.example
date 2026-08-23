@@ -14,7 +14,7 @@ spring:
   r2dbc:
     url: r2dbc:mysql://localhost:3306/pt_carpool?useUnicode=true&characterEncoding=utf8&useSSL=false&serverTimezone=Asia/Shanghai
     username: root
-    password: "change-me"          # 本地 MySQL root 密码
+    password: "123456"          # 本地 MySQL root 密码
 
   # ====== 本地 Redis（无密码）======
   data:
