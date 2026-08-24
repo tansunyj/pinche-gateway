@@ -17,6 +17,15 @@
 
 > 本仓库是其中的 **`pinche-gateway`（网关代理）** 子项目（本地目录 `gateway`）。三个仓库相互独立，需分别 `git clone` / `git push`；跨仓库协作时各自独立提交、互不影响。
 
+## 加入交流群
+
+群号：**663707675**
+
+![Token 拼车群](token拼车群.png)
+
+> 扫码或搜索群号加入 **Token 拼车平台交流群**，获取平台动态、使用答疑与优惠信息。
+> Scan the QR code / search group **663707675** to join the Token Carpool community.
+
 ## 构建与运行
 
 ```bash
