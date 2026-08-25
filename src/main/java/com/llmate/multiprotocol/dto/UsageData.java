@@ -12,7 +12,9 @@ import java.util.Map;
  *
  * 设计原则：
  * 1. 所有维度都有默认值 0，不存在时为 0
- * 2. 计费时如果值为 0 或对应价格为 0/空，则该维度不参与计费
+ * 2. 计费时如果值为 0 或对应价格为 0/空，则该维度不参与计费；
+ *    token 类维度另做「仅同侧兜底」：维度价无效时回落输入主价 inputPer1m / 输出主价 outputPer1m，
+ *    都无效且有用量则由计费层抛 PRICE_NOT_CONFIGURED 拒绝（见 BillingCalculator.resolveTokenPrice）
  * 3. 各平台的原始 usage 数据通过 Converter 转换为这个统一结构
  */
 @Data

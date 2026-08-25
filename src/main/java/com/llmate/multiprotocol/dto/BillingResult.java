@@ -6,6 +6,7 @@ import lombok.Data;
 import lombok.NoArgsConstructor;
 
 import java.math.BigDecimal;
+import java.util.List;
 
 /**
  * 计费结果
@@ -50,6 +51,16 @@ public class BillingResult {
 
     // 套餐折扣比例（如 0.8 表示 8 折）
     private BigDecimal packageMarkup;
+
+    // ============ 车次折扣归属(§5.1,由 BillingCalculator 从 BillingParams 复制) ============
+    /** 命中的折扣车次(全部候选) */
+    private List<Long> rideIds;
+
+    /** 实际生效车次(最低折扣率,单值,用于 ride 维度归属) */
+    private Long effectiveRideId;
+
+    /** 生效车次名称(ride 维度 meta_json) */
+    private String effectiveRideName;
 
     /**
      * 计费多行明细（tokens 消耗 + 各维度费用，\n 拼接，落库到合并日志表 billing_detail 字段）。

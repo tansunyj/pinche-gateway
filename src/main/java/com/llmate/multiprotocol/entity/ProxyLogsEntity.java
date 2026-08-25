@@ -80,6 +80,18 @@ public class ProxyLogsEntity {
     @Column("price_markup")
     private BigDecimal priceMarkup;
 
+    /**
+     * 实际命中折扣的车次ID(逗号分隔,候选全保留,§5.4)
+     */
+    @Column("discount_ride_ids")
+    private String discountRideIds;
+
+    /**
+     * 折扣前原价额度(反推 round(quota_consumed/price_markup),§5.4)
+     */
+    @Column("original_quota")
+    private Long originalQuota;
+
     @Column("created_at")
     private LocalDateTime createdAt;
 

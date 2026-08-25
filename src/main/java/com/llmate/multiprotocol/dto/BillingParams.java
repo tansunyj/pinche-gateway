@@ -3,6 +3,7 @@ package com.llmate.multiprotocol.dto;
 import lombok.Data;
 
 import java.math.BigDecimal;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -59,6 +60,16 @@ public class BillingParams {
 
     // 价格倍率
     private BigDecimal priceMarkup;
+
+    // ============ 车次折扣归属(§5.1,由 BillingService.applyRideDiscount 填充) ============
+    /** 命中的折扣车次(全部候选,供 proxy_logs 审计留存) */
+    private List<Long> rideIds;
+
+    /** 实际生效车次(多车次中最低折扣率的那一个,用于 ride 维度归属,一单只计一个) */
+    private Long effectiveRideId;
+
+    /** 生效车次名称(ride 维度 meta_json) */
+    private String effectiveRideName;
 
     // 模型ID（用于日志）
     private String modelId;

@@ -4,6 +4,8 @@ import com.llmate.multiprotocol.constant.BusinessConstants;
 import com.llmate.multiprotocol.dto.BillingParams;
 import com.llmate.multiprotocol.dto.BillingResult;
 import com.llmate.multiprotocol.dto.UsageData;
+import com.llmate.multiprotocol.exception.LlmErrorCode;
+import com.llmate.multiprotocol.exception.LlmGatewayException;
 import com.llmate.multiprotocol.util.LogBox;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.log4j.Log4j2;
@@ -57,8 +59,13 @@ public class BillingCalculator {
     /**
      * 计算费用（支持套餐折扣）
      *
-     * 计费原则：每个计费维度只有配置了价格（>0）才参与计费，未配置价格（为0/null/负）该维度费用为0。
-     * 计算过程（各维度用量×单价+套餐折扣）通过 LogBox.logBillingDetail 完整打印。
+     * 计费原则（token 类维度支持「仅同侧兜底」，用户确认规则）：
+     * - 维度价有效（>0）→ 按维度价计费；
+     * - 维度价无效（0/null/负）→ 兜底同侧主价：输入侧回落 inputPer1m，输出侧回落 outputPer1m，
+     *   （缓存命中维度、图文/向量/视频token 子维度均适用），避免「有使用量却按 0 计费」的漏收；
+     * - 维度价与同侧主价都无效且该维度有用量 → 抛 PRICE_NOT_CONFIGURED 拒绝计费（不做静默免费）；
+     * - 非 token 维度（按次/按秒/按字符）维持原规则：未配置价格（为0/null/负）该维度费用为0。
+     * 计算过程（各维度用量×单价+折扣）通过 LogBox.logBillingDetail 完整打印。
      *
      * @param billingMode 计费模式
      * @param usage 使用量
@@ -114,6 +121,10 @@ public class BillingCalculator {
                     .currency(displayCurrency)
                     .promptTokens(usage.getInputTokens())
                     .completionTokens(usage.getOutputTokens())
+                    // 车次折扣归属：从 BillingParams 复制(applyRideDiscount 已填充)，供统计/结算落库
+                    .rideIds(params.getRideIds())
+                    .effectiveRideId(params.getEffectiveRideId())
+                    .effectiveRideName(params.getEffectiveRideName())
                     .reasoningTokens(usage.getReasoningTokens())
                     .cacheHitTokens(usage.getCacheHitTokens())
                     .cacheCreationTokens(usage.getCacheCreationTokens())
@@ -204,15 +215,18 @@ public class BillingCalculator {
                 String key = usage.getResolution() + "_" + (usage.isHasInputImage() ? "withInput" : "noInput");
                 BigDecimal price = params.getVideoTokenPrice(key);
                 long tokens = usage.getOutputTokens();
-                if (isValidPrice(price) && tokens > 0) {
+                if (tokens <= 0) {
+                    details.add("视频token(" + key + "): 无用量，费用=0");
+                } else {
+                    // 视频 token 属输出侧维度：未配置该档位价时「仅同侧兜底」到输出主价 outputPer1m；
+                    // 档位价与输出主价都无效且有用量 → resolveTokenPrice 抛 PRICE_NOT_CONFIGURED 拒绝计费（避免漏收）
+                    BigDecimal resolved = resolveTokenPrice(price, false, params, tokens, "视频token(" + key + ")", details);
                     // 费用 = completion_tokens × 单价(元/百万token) ÷ 1M
-                    BigDecimal dimCost = BigDecimal.valueOf(tokens).multiply(price)
+                    BigDecimal dimCost = BigDecimal.valueOf(tokens).multiply(resolved)
                         .divide(BusinessConstants.TOKEN_PER_1M, BusinessConstants.COST_SCALE, BusinessConstants.COST_ROUNDING_MODE);
-                    details.add("视频token(" + key + "): tokens=" + tokens + " × 单价=" + price
+                    details.add("视频token(" + key + "): tokens=" + tokens + " × 单价=" + resolved
                         + "/1M ÷ 1M = " + dimCost.stripTrailingZeros().toPlainString() + " 元");
                     cost = cost.add(dimCost);
-                } else {
-                    details.add("视频token(" + key + "): tokens=" + tokens + "，未配置价格(=" + price + ")，费用=0");
                 }
             }
             case BusinessConstants.BILLING_MODE_EMBEDDING -> {
@@ -270,10 +284,13 @@ public class BillingCalculator {
         cost = cost.add(calcInputTokens(usage, params, details, components));
 
         // 2. 输出 tokens（含/不含推理，取决于 reasoningPer1m 是否配置）
+        //    输出侧维度：未配置输出主价时「仅同侧兜底」无源 → 有用量则抛 PRICE_NOT_CONFIGURED（用户确认规则）
         boolean reasoningPriced = isValidPrice(params.getReasoningPer1m());
         long outputTokens = reasoningPriced ? usage.getEffectiveOutputTokens() : usage.getOutputTokens();
+        BigDecimal outputPrice = resolveTokenPrice(
+            params.getOutputPer1m(), false, params, outputTokens, "输出tokens", details);
         BigDecimal outputCost = calcTokenDimension("输出tokens",
-            outputTokens, params.getOutputPer1m(), details);
+            outputTokens, outputPrice, details);
         cost = cost.add(outputCost);
         components.add(outputCost);
 
@@ -300,10 +317,10 @@ public class BillingCalculator {
      * 输入 tokens 计费（用户确认规则）：输入费用 = 缓存未命中费用 + 缓存命中费用，二者组合构成输入。
      *
      * 始终拆分为「缓存未命中 / 缓存命中」两个维度展示并计费（不再有整体「输入tokens」收费维度）：
-     * - 未命中恒按 inputPer1m；
-     * - 命中按 cacheHitPer1m——仅当 命中价 与 未命中价 都 >0（配置）时命中才打折；
-     *   否则命中按全价 inputPer1m（结果等同整体 输入×inputPer1m，即用户规则
-     *   「命中价/未命中价有一方为 0 → 按总体输入 tokens 算」）。
+     * - 未命中：维度价=输入主价 inputPer1m，无效时「仅同侧兜底」无源 → 有用量则拒绝（PRICE_NOT_CONFIGURED）；
+     * - 命中：维度价=cacheHitPer1m，未配置时兜底同侧主价 inputPer1m（即命中按全价输入价计，
+     *   与用户规则「命中价/未命中价有一方为 0 → 按总体输入 tokens 算」一致）；若 inputPer1m 也无效
+     *   但命中价有效，直接按命中价计（修复边角：只配 cache_hit 时命中不再被静默计 0）。
      * 拆分行之前先打印总输入引用行「输入tokens: X (缓存命中 A + 缓存未命中 B)」，与用量提取口径一致。
      * 命中输入取 cachedInputTokens（cachedTokens / cacheReadTokens / cacheHitTokens 三源合并），
      * 未命中取 cacheMissTokens，缺失时用「输入 - 命中」兜底补齐。
@@ -319,15 +336,15 @@ public class BillingCalculator {
             hit = Math.max(0, totalInput - miss);
         }
 
-        boolean missPriced = isValidPrice(params.getInputPer1m());
-        boolean hitPriced = isValidPrice(params.getCacheHitPer1m());
-        // 命中单价：两价都配置才用 cacheHitPer1m 打折；否则命中按全价 inputPer1m（一方为 0 → 总体按输入价）
-        BigDecimal hitUnitPrice = (missPriced && hitPriced) ? params.getCacheHitPer1m() : params.getInputPer1m();
-
         // 输入tokens 总引用行：输入 = 缓存命中 + 缓存未命中，二者组合构成输入费用（用户规则）
         details.add("输入tokens: " + totalInput + " (缓存命中 " + hit + " + 缓存未命中 " + miss + ")");
-        BigDecimal missProduct = calcTokenDimension("输入tokens(缓存未命中)", miss, params.getInputPer1m(), details);
-        BigDecimal hitProduct = calcTokenDimension("输入tokens(缓存命中)", hit, hitUnitPrice, details);
+        // 未命中/命中两个维度均走「仅同侧兜底」：维度价无效 → 输入主价 inputPer1m；都无效且有用量 → 拒绝
+        BigDecimal missPrice = resolveTokenPrice(
+            params.getInputPer1m(), true, params, miss, "输入tokens(缓存未命中)", details);
+        BigDecimal hitPrice = resolveTokenPrice(
+            params.getCacheHitPer1m(), true, params, hit, "输入tokens(缓存命中)", details);
+        BigDecimal missProduct = calcTokenDimension("输入tokens(缓存未命中)", miss, missPrice, details);
+        BigDecimal hitProduct = calcTokenDimension("输入tokens(缓存命中)", hit, hitPrice, details);
         components.add(missProduct);
         components.add(hitProduct);
         return missProduct.add(hitProduct);
@@ -391,30 +408,74 @@ public class BillingCalculator {
     }
 
     /**
-     * 计算图文混合费用（逐维度：有价格才计费，无价格费用为0）
+     * 计算图文混合费用（逐维度「仅同侧兜底」：维度价无效 → 输入侧回落 inputPer1m / 输出侧回落 outputPer1m；
+     * 都无效且有用量 → 抛 PRICE_NOT_CONFIGURED 拒绝计费，避免漏收）
      */
     private BigDecimal calculateImageTokenCost(UsageData usage, BillingParams params, List<String> details) {
         BigDecimal cost = BigDecimal.ZERO;
 
-        cost = cost.add(calcTokenDimension("图片输入文本tokens", usage.getInputTextTokens(), params.getInputTextPer1m(), details));
-        cost = cost.add(calcTokenDimension("图片输入图片tokens", usage.getInputImageTokens(), params.getInputImagePer1m(), details));
-        cost = cost.add(calcTokenDimension("图片输出文本tokens", usage.getOutputTextTokens(), params.getOutputTextPer1m(), details));
-        cost = cost.add(calcTokenDimension("图片输出图片tokens", usage.getOutputImageTokens(), params.getOutputImagePer1m(), details));
+        cost = cost.add(calcTokenDimension("图片输入文本tokens", usage.getInputTextTokens(),
+            resolveTokenPrice(params.getInputTextPer1m(), true, params, usage.getInputTextTokens(), "图片输入文本tokens", details), details));
+        cost = cost.add(calcTokenDimension("图片输入图片tokens", usage.getInputImageTokens(),
+            resolveTokenPrice(params.getInputImagePer1m(), true, params, usage.getInputImageTokens(), "图片输入图片tokens", details), details));
+        cost = cost.add(calcTokenDimension("图片输出文本tokens", usage.getOutputTextTokens(),
+            resolveTokenPrice(params.getOutputTextPer1m(), false, params, usage.getOutputTextTokens(), "图片输出文本tokens", details), details));
+        cost = cost.add(calcTokenDimension("图片输出图片tokens", usage.getOutputImageTokens(),
+            resolveTokenPrice(params.getOutputImagePer1m(), false, params, usage.getOutputImageTokens(), "图片输出图片tokens", details), details));
 
         return cost;
     }
 
     /**
-     * 计算 Embedding 费用（逐维度：有价格才计费，无价格费用为0）
+     * 计算 Embedding 费用（逐维度「仅同侧兜底」：维度价无效 → 输入侧回落 inputPer1m，embedding 是纯输入操作；
+     * 都无效且有用量 → 抛 PRICE_NOT_CONFIGURED 拒绝计费，避免漏收）
      */
     private BigDecimal calculateEmbeddingCost(UsageData usage, BillingParams params, List<String> details) {
         BigDecimal cost = BigDecimal.ZERO;
 
-        cost = cost.add(calcTokenDimension("文本向量tokens", usage.getTextTokensEmbedding(), params.getTextTokensPer1m(), details));
-        cost = cost.add(calcTokenDimension("图片向量tokens", usage.getImageTokensEmbedding(), params.getImageTokensPer1m(), details));
-        cost = cost.add(calcTokenDimension("通用向量tokens", usage.getVectorTokens(), params.getVectorTokensPer1m(), details));
+        cost = cost.add(calcTokenDimension("文本向量tokens", usage.getTextTokensEmbedding(),
+            resolveTokenPrice(params.getTextTokensPer1m(), true, params, usage.getTextTokensEmbedding(), "文本向量tokens", details), details));
+        cost = cost.add(calcTokenDimension("图片向量tokens", usage.getImageTokensEmbedding(),
+            resolveTokenPrice(params.getImageTokensPer1m(), true, params, usage.getImageTokensEmbedding(), "图片向量tokens", details), details));
+        cost = cost.add(calcTokenDimension("通用向量tokens", usage.getVectorTokens(),
+            resolveTokenPrice(params.getVectorTokensPer1m(), true, params, usage.getVectorTokens(), "通用向量tokens", details), details));
 
         return cost;
+    }
+
+    /**
+     * 解析 token 维度有效单价（计费价格兜底，用户确认规则：**仅同侧兜底**）。
+     *
+     * - 维度价有效（>0）→ 直接用维度价；
+     * - 维度价无效（0/null/负）→ 兜底同侧主价：输入侧回落 inputPer1m，输出侧回落 outputPer1m；
+     * - 维度价与同侧主价都无效，且该维度有用量 → 抛 {@link LlmErrorCode#PRICE_NOT_CONFIGURED} 拒绝计费，
+     *   避免「有使用量却按 0 计费」的费用缺失（用户确认：全无价格可兜时拒绝而非静默免费）；
+     *   无用量（tokens<=0）时不抛，返回 null（由调用方按无用量处理，费用=0）。
+     *
+     * 应用范围：TOKEN（输入未命中/命中、输出）、IMAGE_TOKEN（图文 4 子维度）、
+     * EMBEDDING（向量 3 子维度）、VIDEO_TOKEN（分辨率档位）。
+     * 推理维度除外——其未配置推理价时并入输出按输出主价计费（见 {@link #calculateTokenCost}），
+     * 不在此兜底，避免与输出 tokens 重复计费。
+     *
+     * @return 有效单价；无用量且无价可兜时为 null
+     */
+    private BigDecimal resolveTokenPrice(BigDecimal dimPrice, boolean isInput, BillingParams params,
+                                         long tokens, String dimName, List<String> details) {
+        if (isValidPrice(dimPrice)) {
+            return dimPrice;
+        }
+        String sideName = isInput ? "输入侧主价 inputPer1m" : "输出侧主价 outputPer1m";
+        BigDecimal sideMain = isInput ? params.getInputPer1m() : params.getOutputPer1m();
+        if (isValidPrice(sideMain)) {
+            details.add(dimName + ": 维度价=未配置(" + (dimPrice == null ? "null" : dimPrice.stripTrailingZeros().toPlainString())
+                + ")，兜底" + sideName + "=" + sideMain.stripTrailingZeros().toPlainString());
+            return sideMain;
+        }
+        if (tokens > 0) {
+            throw new LlmGatewayException(LlmErrorCode.PRICE_NOT_CONFIGURED,
+                dimName + " 有用量=" + tokens + " 但维度价与" + sideName + "均未配置(≤0)，无法计费，已拒绝本次扣费");
+        }
+        return null;
     }
 
     /**

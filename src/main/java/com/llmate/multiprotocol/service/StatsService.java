@@ -10,6 +10,7 @@ import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
+import java.math.BigDecimal;
 import java.time.Duration;
 import java.time.LocalDate;
 import java.time.ZoneId;
@@ -32,6 +33,8 @@ public class StatsService {
 
     private static final long KEY_TTL_SECONDS = 30L * 24 * 3600; // 30天过期
     private static final long KEY_TTL_USER_SECONDS = 7L * 24 * 3600; // 用户数据保留7天
+    // 按月键 TTL(§5.3)：需整月持续有效,单独设 90 天,避免月末前过期
+    private static final long KEY_TTL_MONTHLY_SECONDS = 90L * 24 * 3600;
     private static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd");
     private static final ZoneId ZONE_SHANGHAI = ZoneId.of("Asia/Shanghai");
 
@@ -76,6 +79,15 @@ public class StatsService {
                 if (data.latencyMs() > 0) {
                     updateLatencyBucket(data);
                 }
+
+                // 9. 车次维度(命中折扣才归属)
+                updateRideStats(data);
+
+                // 10. 折扣维度(全局)
+                updateDiscountStats(data);
+
+                // 11. 按月聚合(与各维度同构,§5.3)
+                updateMonthlyStats(data);
 
             } catch (Exception e) {
                 log.error("[StatsService] 记录统计失败: {}", e.getMessage());
@@ -144,6 +156,10 @@ public class StatsService {
         redisTemplate.opsForHash().increment(globalKey, "completion_tokens", data.completionTokens()).subscribe();
         redisTemplate.opsForHash().increment(globalKey, "total_tokens", totalTokens).subscribe();
         redisTemplate.opsForHash().increment(globalKey, "quota_consumed", data.quota()).subscribe();
+        // 节省额度(§5.1)：命中车次折扣时累计,供 user/stats 展示"已为你节省"（metric_definitions.saved_quota）
+        if (data.discountRate() != null && data.discountRate().compareTo(BigDecimal.ONE) < 0 && data.savedQuota() > 0) {
+            redisTemplate.opsForHash().increment(globalKey, "saved_quota", data.savedQuota()).subscribe();
+        }
         redisTemplate.opsForHash().increment(globalKey, data.isSuccess() ? "success_count" : "error_count", 1).subscribe();
         redisTemplate.opsForHash().increment(globalKey, "latency_count", 1).subscribe();
         redisTemplate.opsForHash().increment(globalKey, "latency_sum", data.latencyMs()).subscribe();
@@ -367,6 +383,171 @@ public class StatsService {
                 long currentMax = parseLongSafe(maxStr, 0);
                 if (currentMax == 0 || latencyMs > currentMax) {
                     return redisTemplate.opsForHash().put(key, "latency_max", String.valueOf(latencyMs));
+                }
+                return Mono.just(false);
+            })
+            .subscribe();
+    }
+
+    // ==================== 车次 / 折扣 / 按月 维度(§5.1 §5.3) ====================
+
+    /**
+     * 车次维度：stats:ride:{rideId}:{date}。
+     * rideId = 实际生效车次(最低折扣率,单值),一单只计入一个车次,避免跨车次重复。
+     * 字段名即 metric_definitions 目录名(ride_requests / ride_saved_quota),
+     * 便于同步器 generic 映射;discount_rate 用 sum+count 累积(同步器算均值)。
+     */
+    private void updateRideStats(RequestStatsData data) {
+        if (data.rideId() == null) {
+            return; // 无命中车次,不入车次维度
+        }
+        String key = "stats:ride:" + data.rideId() + ":" + data.date();
+
+        redisTemplate.opsForHash().increment(key, "ride_requests", 1).subscribe();
+        redisTemplate.opsForHash().increment(key, "quota", data.quota()).subscribe();
+
+        if (data.discountRate() != null && data.discountRate().compareTo(BigDecimal.ONE) < 0) {
+            redisTemplate.opsForHash().increment(key, "discounted_requests", 1).subscribe();
+            redisTemplate.opsForHash().increment(key, "ride_saved_quota", data.savedQuota()).subscribe();
+            redisTemplate.opsForHash().increment(key, "discount_rate_sum", data.discountRate().doubleValue()).subscribe();
+            updateMinRate(key, data.discountRate());
+        }
+        if (data.rideName() != null) {
+            redisTemplate.opsForHash().put(key, "ride_name", data.rideName()).subscribe();
+        }
+        redisTemplate.expire(key, Duration.ofSeconds(KEY_TTL_SECONDS)).subscribe();
+    }
+
+    /**
+     * 折扣维度(全局)：stats:discount:{date}。
+     * requests=全部请求, discounted_requests=享折扣请求, saved_quota=全平台优惠额度,
+     * discount_rate_min=当日最低生效折扣率(代表最优惠)。
+     */
+    private void updateDiscountStats(RequestStatsData data) {
+        String key = "stats:discount:" + data.date();
+
+        redisTemplate.opsForHash().increment(key, "requests", 1).subscribe();
+        if (data.discountRate() != null && data.discountRate().compareTo(BigDecimal.ONE) < 0) {
+            redisTemplate.opsForHash().increment(key, "discounted_requests", 1).subscribe();
+            redisTemplate.opsForHash().increment(key, "saved_quota", data.savedQuota()).subscribe();
+            redisTemplate.opsForHash().increment(key, "discount_rate_sum", data.discountRate().doubleValue()).subscribe();
+            updateMinRate(key, data.discountRate());
+        }
+        redisTemplate.expire(key, Duration.ofSeconds(KEY_TTL_SECONDS)).subscribe();
+    }
+
+    /**
+     * 按月聚合(§5.3)：网关直接 INCR stats:monthly:{yyyy-MM}:{dim}:{key},与按天同构。
+     * 同步器落库 dim_type='monthly', stat_date=当月首日。无需单独 rollup 任务。
+     */
+    private void updateMonthlyStats(RequestStatsData data) {
+        String month = data.date().length() >= 7 ? data.date().substring(0, 7) : data.date();
+
+        // global
+        incrMonthly(month, "global", "global", "requests", 1);
+        incrMonthly(month, "global", "global", "quota", data.quota());
+        incrMonthly(month, "global", "global", "prompt_tokens", data.promptTokens());
+        incrMonthly(month, "global", "global", "completion_tokens", data.completionTokens());
+        incrMonthly(month, "global", "global", data.isSuccess() ? "success" : "error", 1);
+
+        // channel
+        if (data.channelId() != null) {
+            String ch = "ch:" + data.channelId();
+            incrMonthly(month, "channel", ch, "requests", 1);
+            incrMonthly(month, "channel", ch, "quota", data.quota());
+            incrMonthly(month, "channel", ch, "prompt_tokens", data.promptTokens());
+            incrMonthly(month, "channel", ch, "completion_tokens", data.completionTokens());
+            incrMonthly(month, "channel", ch, data.isSuccess() ? "success" : "error", 1);
+        }
+
+        // token
+        if (data.tokenId() != null) {
+            String tk = "tk:" + data.tokenId();
+            incrMonthly(month, "token", tk, "requests", 1);
+            incrMonthly(month, "token", tk, "quota", data.quota());
+            incrMonthly(month, "token", tk, "prompt_tokens", data.promptTokens());
+            incrMonthly(month, "token", tk, "completion_tokens", data.completionTokens());
+        }
+
+        // model
+        if (data.model() != null && !data.model().isEmpty()) {
+            String md = "md:" + data.model();
+            incrMonthly(month, "model", md, "requests", 1);
+            incrMonthly(month, "model", md, "quota", data.quota());
+            incrMonthly(month, "model", md, "prompt_tokens", data.promptTokens());
+            incrMonthly(month, "model", md, "completion_tokens", data.completionTokens());
+        }
+
+        // user
+        if (data.userId() != null) {
+            String u = "user:" + data.userId();
+            incrMonthly(month, "user", u, "requests", 1);
+            incrMonthly(month, "user", u, "quota", data.quota());
+            if (data.discountRate() != null && data.discountRate().compareTo(BigDecimal.ONE) < 0 && data.savedQuota() > 0) {
+                incrMonthly(month, "user", u, "saved_quota", data.savedQuota());
+            }
+        }
+
+        // composite (ch × md),key 形如 ch:5:md:deepseek/deepseek-v4-flash
+        if (data.channelId() != null && data.model() != null && !data.model().isEmpty()) {
+            String ck = "ch:" + data.channelId() + ":md:" + data.model();
+            incrMonthly(month, "composite", ck, "requests", 1);
+            incrMonthly(month, "composite", ck, "quota", data.quota());
+            incrMonthly(month, "composite", ck, "prompt_tokens", data.promptTokens());
+            incrMonthly(month, "composite", ck, "completion_tokens", data.completionTokens());
+        }
+
+        // ride
+        if (data.rideId() != null) {
+            String rk = "ride:" + data.rideId();
+            incrMonthly(month, "ride", rk, "ride_requests", 1);
+            incrMonthly(month, "ride", rk, "quota", data.quota());
+            if (data.discountRate() != null && data.discountRate().compareTo(BigDecimal.ONE) < 0) {
+                incrMonthly(month, "ride", rk, "discounted_requests", 1);
+                incrMonthly(month, "ride", rk, "ride_saved_quota", data.savedQuota());
+                incrMonthlyDouble(month, "ride", rk, "discount_rate_sum", data.discountRate().doubleValue());
+            }
+        }
+
+        // discount(全局)
+        incrMonthly(month, "discount", "discount", "requests", 1);
+        if (data.discountRate() != null && data.discountRate().compareTo(BigDecimal.ONE) < 0) {
+            incrMonthly(month, "discount", "discount", "discounted_requests", 1);
+            incrMonthly(month, "discount", "discount", "saved_quota", data.savedQuota());
+            incrMonthlyDouble(month, "discount", "discount", "discount_rate_sum", data.discountRate().doubleValue());
+        }
+    }
+
+    /** 按月 Hash 计数 INCR(整数),90 天 TTL */
+    private void incrMonthly(String month, String dim, String key, String field, long incr) {
+        String mkey = "stats:monthly:" + month + ":" + dim + ":" + key;
+        redisTemplate.opsForHash().increment(mkey, field, incr).subscribe();
+        redisTemplate.expire(mkey, Duration.ofSeconds(KEY_TTL_MONTHLY_SECONDS)).subscribe();
+    }
+
+    /** 按月 Hash 计数 INCR(浮点,折扣率累计) */
+    private void incrMonthlyDouble(String month, String dim, String key, String field, double incr) {
+        String mkey = "stats:monthly:" + month + ":" + dim + ":" + key;
+        redisTemplate.opsForHash().increment(mkey, field, incr).subscribe();
+        redisTemplate.expire(mkey, Duration.ofSeconds(KEY_TTL_MONTHLY_SECONDS)).subscribe();
+    }
+
+    /** 记录当日最低生效折扣率(get+compare+put,非原子但统计可接受) */
+    private void updateMinRate(String key, BigDecimal rate) {
+        redisTemplate.opsForHash().get(key, "discount_rate_min")
+            .defaultIfEmpty("")
+            .flatMap(cur -> {
+                String curStr = cur == null ? "" : cur.toString();
+                if (curStr.isEmpty()) {
+                    return redisTemplate.opsForHash().put(key, "discount_rate_min", rate.toPlainString());
+                }
+                try {
+                    if (rate.doubleValue() < Double.parseDouble(curStr)) {
+                        return redisTemplate.opsForHash().put(key, "discount_rate_min", rate.toPlainString());
+                    }
+                } catch (NumberFormatException ignored) {
+                    // 脏值直接覆盖
+                    return redisTemplate.opsForHash().put(key, "discount_rate_min", rate.toPlainString());
                 }
                 return Mono.just(false);
             })
@@ -793,6 +974,13 @@ public class StatsService {
             int completionTokens,
             long quota,
             long latencyMs,
-            boolean isSuccess
+            boolean isSuccess,
+            // ============ 车次折扣归属(§5.1) ============
+            List<Long> rideIds,          // 命中的折扣车次(全部候选)
+            Long rideId,                 // 实际生效车次(最低折扣率,单值)
+            String rideName,             // 生效车次名称(meta)
+            BigDecimal discountRate,     // 实际生效折扣率(未命中=1.0)
+            long originalQuota,          // 折前原价(反推 round(quota/discountRate))
+            long savedQuota              // 优惠额度 = originalQuota - quota
     ) {}
 }

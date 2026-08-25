@@ -55,6 +55,8 @@ public interface ProxyLogsRepository extends R2dbcRepository<ProxyLogsEntity, Lo
                 error_msg = :errorMsg,
                 is_thinking = :isThinking,
                 price_markup = :priceMarkup,
+                discount_ride_ids = :discountRideIds,
+                original_quota = :originalQuota,
                 billing_detail = :billingDetail,
                 aborted = :aborted
             WHERE request_id = :requestId
@@ -71,6 +73,8 @@ public interface ProxyLogsRepository extends R2dbcRepository<ProxyLogsEntity, Lo
             @Param("errorMsg") String errorMsg,
             @Param("isThinking") Integer isThinking,
             @Param("priceMarkup") java.math.BigDecimal priceMarkup,
+            @Param("discountRideIds") String discountRideIds,
+            @Param("originalQuota") Long originalQuota,
             @Param("billingDetail") String billingDetail,
             @Param("aborted") Integer aborted);
 

@@ -16,7 +16,10 @@ import org.springframework.web.server.ServerWebExchange;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
 
+import java.math.BigDecimal;
+import java.math.RoundingMode;
 import java.time.LocalDateTime;
+import java.util.stream.Collectors;
 
 /**
  * 结算/审计日志服务
@@ -77,6 +80,9 @@ public class SettlementService {
             .errorMsg(errorMsg)
             .isThinking(0)
             .priceMarkup(costResult.getPackageMarkup())
+            // 车次折扣归属(§5.4)：候选全保留 + 折前原价(反推)
+            .discountRideIds(joinRideIds(costResult))
+            .originalQuota(reverseOriginalQuota(costResult))
             .billingDetail(costResult.getBillingDetail())
             .createdAt(LocalDateTime.now())
             .aborted(0)
@@ -115,6 +121,9 @@ public class SettlementService {
             .status(status)
             .isThinking(0)
             .priceMarkup(costResult.getPackageMarkup())
+            // 车次折扣归属(§5.4)：候选全保留 + 折前原价(反推)
+            .discountRideIds(joinRideIds(costResult))
+            .originalQuota(reverseOriginalQuota(costResult))
             .billingDetail(costResult.getBillingDetail())
             .createdAt(LocalDateTime.now())
             .aborted(0)
@@ -143,6 +152,8 @@ public class SettlementService {
                     proxyLogs.getErrorMsg(),
                     proxyLogs.getIsThinking(),
                     proxyLogs.getPriceMarkup(),
+                    proxyLogs.getDiscountRideIds(),
+                    proxyLogs.getOriginalQuota(),
                     proxyLogs.getBillingDetail(),
                     proxyLogs.getAborted())
                 .block();
@@ -411,6 +422,37 @@ public class SettlementService {
             .doOnError(e -> log.error("Failed to save request log", e))
             .contextWrite(c -> c.put(SystemConstants.CONTEXT_REQUEST_ID_KEY, proxyLogs.getRequestId()))
             .subscribe();
+    }
+
+    // ==================== 折扣归属计算(§5.4) ====================
+
+    /**
+     * 命中折扣车次候选拼接为逗号分隔字符串(审计留存)。
+     * 无命中返回 null(列 DEFAULT NULL)。
+     */
+    private String joinRideIds(BillingResult costResult) {
+        if (costResult == null || costResult.getRideIds() == null || costResult.getRideIds().isEmpty()) {
+            return null;
+        }
+        return costResult.getRideIds().stream()
+                .map(String::valueOf)
+                .collect(Collectors.joining(","));
+    }
+
+    /**
+     * 折前原价(反推)：round(quota_consumed / price_markup)。
+     * 已定接受取整误差(§0.0-11),网关不返回精确原价。无折扣(rate>=1)时原价=实扣。
+     */
+    private Long reverseOriginalQuota(BillingResult costResult) {
+        if (costResult == null) {
+            return null;
+        }
+        long quota = costResult.getQuota();
+        BigDecimal markup = costResult.getPackageMarkup() != null ? costResult.getPackageMarkup() : BigDecimal.ONE;
+        if (markup.compareTo(BigDecimal.ONE) < 0 && quota > 0) {
+            return new BigDecimal(quota).divide(markup, 0, RoundingMode.HALF_UP).longValue();
+        }
+        return quota;
     }
 
     // ==================== 内部工具方法 ====================

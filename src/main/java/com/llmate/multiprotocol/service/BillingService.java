@@ -70,11 +70,74 @@ public class BillingService {
      *
      * 关键安全修复：渠道专属 + 全局都查不到价格时，直接抛 {@link LlmErrorCode#PRICE_NOT_CONFIGURED}
      * 拒绝本次调用，绝不兜底成全 0 价格 —— 否则未配价的模型会被静默 0 元计费（可被用户白嫖）。
+     *
+     * 在查到价格实体后追加 {@link #validateTokenPrices} 预检：token 类计费模式若「全无可用 token 单价」
+     * （维度价与同侧主价全部 ≤0），在调用上游前就拒绝（PRICE_NOT_CONFIGURED，HTTP 400），
+     * 杜绝「有使用量却按 0 计费」的费用缺失（与 {@link BillingCalculator#resolveTokenPrice} 的
+     * 仅同侧兜底规则配套）。
      */
     public Mono<ModelPricesEntity> getPriceConfig(String modelId, Long channelId) {
         return modelPricesRepository.findByModelIdAndChannelId(modelId, channelId)
             .switchIfEmpty(modelPricesRepository.findByModelIdAndChannelIdIsNull(modelId))
-            .switchIfEmpty(Mono.error(new LlmGatewayException(LlmErrorCode.PRICE_NOT_CONFIGURED, modelId)));
+            .switchIfEmpty(Mono.error(new LlmGatewayException(LlmErrorCode.PRICE_NOT_CONFIGURED, modelId)))
+            .flatMap(config -> validateTokenPrices(config, modelId));
+    }
+
+    /**
+     * token 类计费模式的「全无价格可兜」预检（用户确认规则：全 0 时拒绝请求而非静默免费）。
+     *
+     * 计费计算时每个 token 维度已做「仅同侧兜底」（维度价 → 同侧主价），此预检在上游调用前拦截
+     * 「整个模式没有任何可用 token 单价」的模型（billing_params 为空 / 全 0 / 只配了无关字段），
+     * 让客户端收到干净的 400 错误，而不是先调上游再在结算时拒扣（白嫖）。
+     *
+     * 各模式判定（真实请求必然产生对应侧的用量，故按侧要求）：
+     * - token       ：输入/输出两个主价(input/output_per_1m)都须 >0（对话必然同时有输入+输出）；
+     * - image_token ：输入侧与输出侧各须有 ≥1 个可用价（主价或对应图文子价）；
+     * - embedding   ：输入侧须有 ≥1 个可用价（主价或向量子价；embedding 是纯输入操作）；
+     * - video_token ：输出侧须有 ≥1 个可用价（主价或任一分辨率档位价）；
+     * - 其余模式（按次/按秒/按字符）无输入输出价格概念，维持现状（价格 0 = 免费）。
+     */
+    private Mono<ModelPricesEntity> validateTokenPrices(ModelPricesEntity config, String modelId) {
+        String mode = config.getBillingMode() == null ? "" : config.getBillingMode().toLowerCase();
+        boolean usable;
+        switch (mode) {
+            case BusinessConstants.BILLING_MODE_TOKEN -> usable =
+                    isValidPrice(getPriceFromBillingParams(config, "input_per_1m"))
+                    && isValidPrice(getPriceFromBillingParams(config, "output_per_1m"));
+            case BusinessConstants.BILLING_MODE_IMAGE_TOKEN -> usable =
+                    sideUsable(config, "input_per_1m", "input_text_per_1m", "input_image_per_1m")
+                    && sideUsable(config, "output_per_1m", "output_text_per_1m", "output_image_per_1m");
+            case BusinessConstants.BILLING_MODE_EMBEDDING -> usable =
+                    sideUsable(config, "input_per_1m", "text_tokens_per_1m", "image_tokens_per_1m", "vector_tokens_per_1m");
+            case BusinessConstants.BILLING_MODE_VIDEO_TOKEN -> usable =
+                    sideUsable(config, "output_per_1m", "input_per_1m") || hasUsableVideoTokenPrice(config);
+            default -> usable = true; // 非 token 模式维持现状
+        }
+        if (usable) {
+            return Mono.just(config);
+        }
+        log.warn("[BillingService] 价格预检拒绝: modelId={}, billingMode={}, billing_params 无可用 token 单价(全部≤0)，拒绝调用",
+            modelId, config.getBillingMode());
+        return Mono.error(new LlmGatewayException(LlmErrorCode.PRICE_NOT_CONFIGURED, modelId));
+    }
+
+    /** 一组价格 key 中是否有任一有效（>0）单价 */
+    private boolean sideUsable(ModelPricesEntity config, String... keys) {
+        for (String k : keys) {
+            if (isValidPrice(getPriceFromBillingParams(config, k))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private boolean isValidPrice(BigDecimal p) {
+        return p != null && p.compareTo(BigDecimal.ZERO) > 0;
+    }
+
+    /** 视频 token 档位价（billing_params 各分辨率 key）是否至少有一个有效单价 */
+    private boolean hasUsableVideoTokenPrice(ModelPricesEntity config) {
+        return parseVideoTokenPrices(config).values().stream().anyMatch(this::isValidPrice);
     }
 
     /**
@@ -435,6 +498,9 @@ public class BillingService {
         if (userId == null) {
             log.info("[BillingService] 车次折扣: userId=null（无关联用户）, 无车次折扣, 原价(×1.0)");
             params.setPriceMarkup(BigDecimal.ONE);
+            params.setRideIds(null);
+            params.setEffectiveRideId(null);
+            params.setEffectiveRideName(null);
             return timeBasedPricingService.applyTimePricing(params, priceConfig.getId(), ZonedDateTime.now());
         }
 
@@ -468,6 +534,9 @@ public class BillingService {
         if (candidates == null || candidates.isEmpty()) {
             log.info("[BillingService] 车次折扣: userId={}, modelId={}, 无已发车车次（未加入 / 未发车 / 已取消 / 已结束）, 原价(×1.0)", userId, modelId);
             params.setPriceMarkup(BigDecimal.ONE);
+            params.setRideIds(null);
+            params.setEffectiveRideId(null);
+            params.setEffectiveRideName(null);
             return;
         }
 
@@ -481,6 +550,10 @@ public class BillingService {
         BigDecimal bestRate = BigDecimal.ONE;       // 最终折扣（多车次取最低），无命中=1.0
         List<String> hitDescs = new ArrayList<>();  // 命中车次描述
         List<String> missDescs = new ArrayList<>(); // 未命中车次 + 原因
+        // 车次折扣归属(§5.1)：全部命中候选 + 实际生效(最低折扣率)车次
+        List<Long> hitRideIds = new ArrayList<>();
+        Long effectiveRideId = null;
+        String effectiveRideName = null;
 
         for (List<RideCandidateRow> rows : byRide.values()) {
             RideCandidateRow first = rows.get(0);
@@ -533,8 +606,12 @@ public class BillingService {
             }
 
             if (rideActive && memberActive && departed && notExpired && modelHit) {
+                // 记录全部命中候选(审计留存)；新最低折扣率车次记为实际生效(ride 维度归属)
+                hitRideIds.add(first.getRideId());
                 if (rideBest.compareTo(bestRate) < 0) {
                     bestRate = rideBest;
+                    effectiveRideId = first.getRideId();
+                    effectiveRideName = first.getRideName();
                 }
                 hitDescs.add(String.format("rideId=%d, rideName=%s, discountRate=%s",
                         first.getRideId(), first.getRideName(), rideBest.toPlainString()));
@@ -564,6 +641,16 @@ public class BillingService {
                     userId, modelId, byRide.size(), hitDescs.size(), bestRate.toPlainString());
         }
         params.setPriceMarkup(bestRate);
+        // 归属：无命中时清空；有命中时 rideIds=全部候选, effectiveRideId=最低折扣率车次
+        if (hitRideIds.isEmpty()) {
+            params.setRideIds(null);
+            params.setEffectiveRideId(null);
+            params.setEffectiveRideName(null);
+        } else {
+            params.setRideIds(hitRideIds);
+            params.setEffectiveRideId(effectiveRideId);
+            params.setEffectiveRideName(effectiveRideName);
+        }
     }
 
     /**
@@ -621,6 +708,20 @@ public class BillingService {
             int minute = now.getMinute();
 
             // 1. Redis 实时统计
+            // 车次折扣归属(§5.1)：命中车次全候选 + 生效车次 + 折扣率 + 折前原价(反推)
+            List<Long> rideIds = costResult != null ? costResult.getRideIds() : null;
+            Long rideId = costResult != null ? costResult.getEffectiveRideId() : null;
+            String rideName = costResult != null ? costResult.getEffectiveRideName() : null;
+            BigDecimal discountRate = costResult != null && costResult.getPackageMarkup() != null
+                    ? costResult.getPackageMarkup() : BigDecimal.ONE;
+            long quota = costResult != null ? costResult.getQuota() : 0;
+            long originalQuota = quota;
+            if (discountRate.compareTo(BigDecimal.ONE) < 0 && quota > 0) {
+                // 反推原价: round(quota / discountRate)；接受取整误差(§0.0-11)
+                originalQuota = new BigDecimal(quota).divide(discountRate, 0, java.math.RoundingMode.HALF_UP).longValue();
+            }
+            long savedQuota = Math.max(originalQuota - quota, 0);
+
             StatsService.RequestStatsData statsData = new StatsService.RequestStatsData(
                 date,
                 hour,
@@ -636,7 +737,13 @@ public class BillingService {
                 (int) usageData.getOutputTokens(),
                 costResult != null ? costResult.getQuota() : 0,
                 latency,
-                isSuccess
+                isSuccess,
+                rideIds,
+                rideId,
+                rideName,
+                discountRate,
+                originalQuota,
+                savedQuota
             );
             statsService.recordRequest(statsData)
                 .contextWrite(c -> c.put(SystemConstants.CONTEXT_REQUEST_ID_KEY, ctx.getRequestId()))

@@ -5,17 +5,22 @@ import com.llmate.multiprotocol.converter.upstream.OpenAiFormatConverter;
 import com.llmate.multiprotocol.dto.LlmChatRequest;
 import com.llmate.multiprotocol.dto.LlmChatResponse;
 import com.llmate.multiprotocol.dto.LlmStreamChunk;
+import com.llmate.multiprotocol.dto.LlmToolCall;
+import com.llmate.multiprotocol.dto.LlmUsage;
 import com.llmate.multiprotocol.dto.ModelEndpointConfig;
 import com.llmate.multiprotocol.dto.openai.OpenAiChatRequest;
 import com.llmate.multiprotocol.dto.openai.OpenAiChatResponse;
 import com.llmate.multiprotocol.dto.openai.OpenAiStreamChunk;
 import com.llmate.multiprotocol.engine.provider.AbstractProviderAdapter;
+import com.llmate.multiprotocol.util.LogBox;
 import com.llmate.multiprotocol.util.UrlUtils;
 import lombok.extern.log4j.Log4j2;
+import org.springframework.http.MediaType;
 import org.springframework.web.reactive.function.client.WebClient;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -110,8 +115,10 @@ public abstract class OpenAiCompatibleAdapter extends AbstractProviderAdapter {
 
         logRequest("非流式", fullUrl, openAiReq);
 
-        return doPostBlocking(uri, openAiReq, OpenAiChatResponse.class,
-                        formatConverter::toInternalResponse, endpointConfig)
+        // 部分上游(如兴鼎 xdwl)即使收到 stream:false 也可能返回 text/event-stream；
+        // doPostBlocking 的 bodyToMono 读 SSE 会抛 UnsupportedOperationException(SSE 只能以 Flux 读)，
+        // 故改用 doPostBlockingTolerant 按响应 Content-Type 分流，SSE 聚合回单个非流式响应。
+        return doPostBlockingTolerant(openAiReq, uri, endpointConfig)
                 .doOnNext(resp -> log.info("[{}] 非流式响应完成: id={}", getProviderName(), resp.getId()))
                 .doOnError(e -> logError("非流式", e));
     }
@@ -169,6 +176,135 @@ public abstract class OpenAiCompatibleAdapter extends AbstractProviderAdapter {
                 // 上游流错误禁止吞成空 chunk（会静默丢失错误 + 客户端永远收不到提示），
                 // 必须 Flux.error(e) 传播到 Controller 统一转 SSE error 事件（GatewayErrorResponseBuilder.streamErrorEvents）
                 ;
+    }
+
+    // ==================== 非流式容错调用 ====================
+
+    /**
+     * 非流式容错调用：部分上游（如兴鼎 xdwl）即使收到 stream:false 也照常返回 text/event-stream，
+     * 而 WebClient 的 bodyToMono 读 SSE 会抛 UnsupportedOperationException（SSE 只能以 Flux 读）。
+     * 这里用 exchangeToMono 按响应 Content-Type 分流：
+     * - text/event-stream → 复用已验证的流式解析管线，把整条流聚合回单个非流式响应（tool_call 参数
+     *   累积、usage 提取与流式路径一致）；
+     * - 普通 JSON → 与 doPostBlocking 一致解析；
+     * - 非 2xx → 照常抛错（exchangeToMono 不会像 retrieve() 那样自动抛 4xx/5xx，必须手动转异常，
+     *   否则错误会被吞成成功空响应）。
+     */
+    private Mono<LlmChatResponse> doPostBlockingTolerant(OpenAiChatRequest request, String uri, ModelEndpointConfig endpointConfig) {
+        return Mono.deferContextual(ctxView -> {
+            String requestId = ctxView.getOrDefault("requestId", "N/A");
+            Long userId = ctxView.getOrDefault("userId", null);
+
+            String fullUrl = endpointConfig != null && endpointConfig.getFullUrl() != null
+                    ? endpointConfig.getFullUrl()
+                    : UrlUtils.join(baseUrl, uri);
+            LogBox.logUpstreamRequest(getProviderName(), fullUrl, maskForLog(request), requestId, userId);
+
+            // 自定义端点用完整 URL（与 doPostBlockingWithFullUrl 一致，mutate 保留超时/codecs 配置）；
+            // 否则 uri 剥离前导斜杠作为相对路径（避免 / 开头替换掉 baseUrl 的路径段，见 doPostBlocking 注释）。
+            WebClient.RequestBodySpec uriSpec = (endpointConfig != null && endpointConfig.getFullUrl() != null && !endpointConfig.getFullUrl().isEmpty())
+                    ? webClient.mutate().build().post().uri(endpointConfig.getFullUrl())
+                    : webClient.post().uri(UrlUtils.stripLeadingSlash(uri));
+
+            return uriSpec.bodyValue(request)
+                    .exchangeToMono(response -> {
+                        if (!response.statusCode().is2xxSuccessful()) {
+                            return response.createException().flatMap(e -> Mono.error(e));
+                        }
+                        MediaType contentType = response.headers().contentType().orElse(null);
+                        if (contentType != null && contentType.isCompatibleWith(MediaType.TEXT_EVENT_STREAM)) {
+                            log.warn("[{}] 上游忽略 stream:false 返回 text/event-stream，改用流式解析并聚合", getProviderName());
+                            return response.bodyToFlux(String.class)
+                                    .transform(this::parseOpenAiCompatibleSse)
+                                    .mapNotNull(json -> safeReadValue(json, OpenAiStreamChunk.class))
+                                    .mapNotNull(formatConverter::toInternalStreamChunk)
+                                    .map(new ToolCallArgsAccumulator()::process)
+                                    .collectList()
+                                    .map(this::assembleChatResponse);
+                        }
+                        return response.bodyToMono(OpenAiChatResponse.class)
+                                .map(formatConverter::toInternalResponse);
+                    })
+                    .doOnNext(resp -> LogBox.logUpstreamResponse(getProviderName(), maskForLog(resp), requestId, userId))
+                    .doOnError(e -> logError("非流式", e));
+        });
+    }
+
+    /**
+     * 把聚合后的流式块列表重组为单个非流式响应：
+     * - 内容 = 各块 deltaContent 直接拼接（不插分隔符，流式切块无空白边界，插符会改变原文）；
+     * - 工具调用 = 终止块补发的 name+完整参数（ToolCallArgsAccumulator 已在终止块注入）；
+     * - usage / finishReason / model / id 取首个非 null。
+     */
+    private LlmChatResponse assembleChatResponse(List<LlmStreamChunk> chunks) {
+        StringBuilder content = new StringBuilder();
+        List<LlmToolCall> toolCalls = new ArrayList<>();
+        LlmUsage usage = null;
+        String finishReason = null;
+        String model = null;
+        String id = null;
+
+        for (LlmStreamChunk chunk : chunks) {
+            if (chunk.getDeltaContent() != null) {
+                content.append(chunk.getDeltaContent());
+            }
+            // 仅终止块携带完整工具调用（name+完整参数），其余块参数片段已被累积器清空
+            if (chunk.getToolCallName() != null && !chunk.getToolCallName().isEmpty()) {
+                toolCalls.add(LlmToolCall.builder()
+                        .id(chunk.getToolCallId())
+                        .name(chunk.getToolCallName())
+                        .arguments(chunk.getToolCallArgumentsDelta() != null
+                                ? chunk.getToolCallArgumentsDelta() : "{}")
+                        .build());
+            }
+            if (usage == null) {
+                usage = chunk.getUsage();
+            }
+            if (finishReason == null) {
+                finishReason = chunk.getFinishReason();
+            }
+            if (model == null) {
+                model = chunk.getModel();
+            }
+            if (id == null) {
+                id = chunk.getId();
+            }
+        }
+
+        LlmChatResponse response = new LlmChatResponse();
+        response.setId(id);
+        response.setModel(model);
+        LlmChatResponse.Choice choice = new LlmChatResponse.Choice();
+        choice.setIndex(0);
+        LlmChatResponse.Message message = new LlmChatResponse.Message();
+        message.setRole("assistant");
+        message.setContent(content.toString());
+        if (!toolCalls.isEmpty()) {
+            message.setToolCalls(toolCalls);
+        }
+        choice.setMessage(message);
+        choice.setFinishReason(finishReason);
+        response.setChoices(List.of(choice));
+        response.setUsage(toResponseUsage(usage));
+        return response;
+    }
+
+    /** 内部流式 LlmUsage → 非流式响应 Usage（全维度映射，未提供维度保持默认 0） */
+    private LlmChatResponse.Usage toResponseUsage(LlmUsage usage) {
+        if (usage == null) {
+            return null;
+        }
+        LlmChatResponse.Usage u = new LlmChatResponse.Usage();
+        u.setPromptTokens(usage.getPromptTokens());
+        u.setCompletionTokens(usage.getCompletionTokens());
+        u.setTotalTokens(usage.getTotalTokens());
+        u.setReasoningTokens(usage.getReasoningTokens());
+        u.setCacheHitTokens(usage.getCacheHitTokens());
+        u.setCacheMissTokens(usage.getCacheMissTokens());
+        u.setCacheCreationTokens(usage.getCacheCreationTokens());
+        u.setCacheReadTokens(usage.getCacheReadTokens());
+        u.setCachedTokens(usage.getCachedTokens());
+        return u;
     }
 
     /**
