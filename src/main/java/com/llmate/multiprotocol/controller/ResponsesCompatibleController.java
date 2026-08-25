@@ -4,6 +4,7 @@ import com.llmate.multiprotocol.config.GatewayErrorResponseBuilder;
 import com.llmate.multiprotocol.constant.ProtocolType;
 import com.llmate.multiprotocol.annotation.RequireApiKey;
 import com.llmate.multiprotocol.converter.ResponsesProtocolConverter;
+import com.llmate.multiprotocol.dto.PreparedStream;
 import com.llmate.multiprotocol.dto.openai.OpenAiResponsesRequest;
 import com.llmate.multiprotocol.dto.openai.OpenAiResponsesResponse;
 import com.llmate.multiprotocol.engine.LlmGateway;
@@ -60,14 +61,19 @@ public class ResponsesCompatibleController {
 
         if (isStreamRequest) {
             log.info("[Responses-Controller] 进入流式处理流程");
-            return Mono.just(ResponseEntity.ok()
-                    .contentType(MediaType.TEXT_EVENT_STREAM)
-                    .header("Cache-Control", "no-cache, no-store, must-revalidate")
-                    .header("Pragma", "no-cache")
-                    .header("Expires", "0")
-                    .header("X-Accel-Buffering", "no")
-                    .header("Connection", "keep-alive")
-                    .body(handleStreamingRequest(request, maskedModel, exchange)));
+            // 预飞先行：模型路由 / 价格查询 / 余额预占 在 SSE 响应头发出【之前】完成。
+            // 余额不足等 setup 错误直接在 Mono 上失败 → GlobalExceptionHandler 返回普通 HTTP 错误，
+            // 而不是 200 + SSE error 事件；只有流已提交后的失败才走 SSE error。
+            return converter.toInternalRequest(request)
+                    .flatMap(internalRequest -> gateway.prepareStream(internalRequest, exchange))
+                    .map(prepared -> ResponseEntity.ok()
+                            .contentType(MediaType.TEXT_EVENT_STREAM)
+                            .header("Cache-Control", "no-cache, no-store, must-revalidate")
+                            .header("Pragma", "no-cache")
+                            .header("Expires", "0")
+                            .header("X-Accel-Buffering", "no")
+                            .header("Connection", "keep-alive")
+                            .body(toSseStream(prepared, request, maskedModel, exchange)));
         } else {
             log.info("[Responses-Controller] 进入非流式处理流程");
             return handleBlockingRequest(request, exchange)
@@ -88,13 +94,14 @@ public class ResponsesCompatibleController {
                 .doOnError(e -> log.error("[Responses-Controller] 非流式请求处理失败", e));
     }
 
-    private Flux<ServerSentEvent<Object>> handleStreamingRequest(OpenAiResponsesRequest request, String maskedModelName, ServerWebExchange exchange) {
-        log.info("[Responses-Controller] 开始流式请求处理");
-        return converter.toInternalRequest(request)
-                .doOnNext(req -> log.info("[Responses-Controller] 内部请求已构建: model={}, messages={}",
-                        req.getModel(), req.getMessages() != null ? req.getMessages().size() : 0))
-                .flatMapMany(internalRequest -> gateway.chatStream(internalRequest, exchange))
-                .transform(stream -> converter.toExternalStream(stream, request, maskedModelName))
+    /**
+     * 流式输出（SSE 响应已提交后）：把预飞好的上游流转成 Responses SSE 事件。
+     * 此处的失败（上游中途报错）已进入 SSE 流，统一转流内 error 事件；
+     * setup 阶段（余额预占等）的错误已被 prepareStream 挡在响应提交前，不会走到这里。
+     */
+    private Flux<ServerSentEvent<Object>> toSseStream(PreparedStream prepared, OpenAiResponsesRequest request, String maskedModelName, ServerWebExchange exchange) {
+        log.info("[Responses-Controller] 开始流式输出");
+        return converter.toExternalStream(prepared.getFlux(), request, maskedModelName)
                 .doOnNext(sse -> log.debug("[Responses-Controller] 流式输出chunk: {}", sse.data()))
                 .doOnComplete(() -> log.info("[Responses-Controller] 流式输出完成"))
                 .doOnError(e -> log.error("[Responses-Controller] 流式请求处理失败", e))

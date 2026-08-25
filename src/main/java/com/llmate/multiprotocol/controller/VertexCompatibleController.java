@@ -5,6 +5,7 @@ import com.llmate.multiprotocol.constant.ProtocolType;
 import com.llmate.multiprotocol.annotation.RequireApiKey;
 import com.llmate.multiprotocol.converter.upstream.VertexFormatConverter;
 import com.llmate.multiprotocol.dto.LlmChatRequest;
+import com.llmate.multiprotocol.dto.PreparedStream;
 import com.llmate.multiprotocol.dto.vertex.VertexGenerateContentRequest;
 import com.llmate.multiprotocol.dto.vertex.VertexGenerateContentResponse;
 import com.llmate.multiprotocol.engine.LlmGateway;
@@ -95,8 +96,11 @@ public class VertexCompatibleController {
             response.getHeaders().set("X-Accel-Buffering", "no");
             response.getHeaders().set(HttpHeaders.CONNECTION, "keep-alive");
 
-            // 直接返回 Flux，WebFlux 会以 Chunked 方式实时向客户端推送数据
-            return handleStreamingRequest(internalReq, modelPath, exchange);
+            // 预飞先行：模型路由 / 价格查询 / 余额预占 在 SSE 响应头发出【之前】完成。
+            // 余额不足等 setup 错误直接在 Mono 上失败 → GlobalExceptionHandler 返回普通 HTTP 错误，
+            // 而不是 200 + SSE error 事件；只有流已提交后的失败才走 SSE error。
+            return gateway.prepareStream(internalReq, exchange)
+                    .flatMapMany(prepared -> toSseStream(prepared, modelPath, exchange));
         } else {
             log.info("[Vertex-Controller] 识别为【非流式】请求: modelPath={}", modelPath);
             return handleBlockingRequest(internalReq, modelPath, exchange);
@@ -118,12 +122,13 @@ public class VertexCompatibleController {
     }
 
     /**
-     * 流式请求处理
-     * 直接返回 Flux<ServerSentEvent<Object>>，由 WebFlux 驱动按需流式下发
+     * 流式输出（SSE 响应已提交后）：把预飞好的上游流转成 Vertex SSE 事件，末尾附 [DONE]。
+     * 此处的失败（上游中途报错）已进入 SSE 流，统一转流内 error 事件；
+     * setup 阶段（余额预占等）的错误已被 prepareStream 挡在响应提交前，不会走到这里。
      */
-    private Flux<ServerSentEvent<Object>> handleStreamingRequest(LlmChatRequest internalReq, String modelPath, ServerWebExchange exchange) {
-        log.info("[Vertex-Controller] 开始流式请求处理");
-        return gateway.chatStream(internalReq, exchange)
+    private Flux<ServerSentEvent<Object>> toSseStream(PreparedStream prepared, String modelPath, ServerWebExchange exchange) {
+        log.info("[Vertex-Controller] 开始流式输出");
+        return prepared.getFlux()
                 .doOnSubscribe(sub -> log.info("[Vertex-Controller] 开始订阅 gateway 流"))
                 .doOnNext(chunk -> log.info("[Vertex-Controller] 收到内部chunk: deltaContent={}, finished={}",
                         chunk.getDeltaContent(), chunk.isFinished()))

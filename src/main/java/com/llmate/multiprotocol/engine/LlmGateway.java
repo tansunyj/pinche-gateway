@@ -91,15 +91,41 @@ public class LlmGateway {
     }
 
     /**
-     * 流式调用
+     * 流式调用（兼容入口）。
+     *
+     * 内部先走 {@link #prepareStream} 完成 路由/价格/余额预占 等 setup 阶段再订阅上游流。
+     * 注意：setup 阶段错误（余额不足等）会随内部 Mono 失败传播到本 Flux，旧调用方需自行
+     * 将其转成流内 SSE error 事件。
+     *
+     * @deprecated 建议 Controller 改用 {@link #prepareStream}：在 SSE 响应提交【之前】完成预占，
+     *             setup 失败可直接返回普通 HTTP 错误（如 402 余额不足），而非 200 + SSE error 事件。
      */
+    @Deprecated
     public Flux<LlmStreamChunk> chatStream(LlmChatRequest internalRequest, ServerWebExchange exchange) {
+        return prepareStream(internalRequest, exchange).flatMapMany(PreparedStream::getFlux);
+    }
+
+    /**
+     * 流式请求预飞：在响应提交【之前】完成 模型路由 → 渠道解析 → 价格查询 → 余额预占 →
+     * 请求日志开始 → 端点解析 全部 setup 阶段，返回持有「已预占、可直接订阅」上游流的
+     * {@link PreparedStream}。
+     *
+     * 关键价值：setup 阶段任何业务错误（如 BALANCE_INSUFFICIENT）都会在此 Mono 上失败——此时
+     * SSE 的 200 响应头尚未发出，Controller 可交给 {@link com.llmate.multiprotocol.config.GlobalExceptionHandler}
+     * 返回普通 HTTP 错误响应（402 余额不足），客户端拿到的是干净的报错，而不是 200 + SSE error 事件。
+     *
+     * 预占的余额由 {@link PreparedStream#getFlux()}（executeStreamAndHandleBilling）在
+     * 正常结算 / 失败清理 / 客户端断开兜底中释放，与旧 chatStream 行为一致。
+     */
+    public Mono<PreparedStream> prepareStream(LlmChatRequest internalRequest, ServerWebExchange exchange) {
         String modelPath = internalRequest.getModel();
         String requestId = UserContext.getOrGenerateRequestId(exchange);
         exchange.getAttributes().put(REQUEST_ID_ATTR, requestId);
-        log.info("[LlmGateway] 流式调用开始: model={}, requestId={}", modelPath, requestId);
+        log.info("[LlmGateway] 流式预飞开始: model={}, requestId={}", modelPath, requestId);
 
-        return routeAndExecuteStream(modelPath, internalRequest, requestId, exchange);
+        long startTime = System.currentTimeMillis();
+        return modelRouter.resolve(modelPath)
+            .flatMap(routing -> prepareStreamWithBilling(routing, internalRequest, requestId, startTime, exchange));
     }
 
     /**
@@ -251,19 +277,13 @@ public class LlmGateway {
     }
 
     /**
-     * 路由并执行流式调用（编排计费与日志）
+     * 流式 setup 阶段（在响应提交前执行，Mono）：保存原始模型信息 → 构建 StreamContext →
+     * 响应式获取 Provider → 查价格 → 预占余额 → 记录请求日志开始 → 解析端点配置。
+     *
+     * 返回持有「可直接订阅」上游流的 {@link PreparedStream}。任何一步失败（如余额不足）都在
+     * 此 Mono 上抛出，保证客户端在 SSE 响应头发出前就能拿到普通 HTTP 错误。
      */
-    private Flux<LlmStreamChunk> routeAndExecuteStream(String modelPath, LlmChatRequest internalRequest, String requestId, ServerWebExchange exchange) {
-        long startTime = System.currentTimeMillis();
-
-        return modelRouter.resolve(modelPath)
-            .flatMapMany(routing -> executeStreamWithBilling(routing, internalRequest, requestId, startTime, exchange));
-    }
-
-    /**
-     * 执行流式请求并编排计费
-     */
-    private Flux<LlmStreamChunk> executeStreamWithBilling(
+    private Mono<PreparedStream> prepareStreamWithBilling(
             RoutingResult routing,
             LlmChatRequest internalRequest,
             String requestId,
@@ -288,28 +308,28 @@ public class LlmGateway {
 
         // 响应式获取 Provider（支持懒加载：新增渠道首次访问自动从 DB 加载并注册到内存）
         return findProviderAsync(routing.getChannelCode(), routing.getProviderAlias())
-            .flatMapMany(provider -> {
+            .flatMap(provider -> {
                 context.provider = provider;
 
                 log.info("[LlmGateway] 流式调用路由到Provider: {}, providerAlias={}, upstreamModel={}",
                     provider.getProviderName(), routing.getProviderAlias(), routing.getUpstreamModel());
 
                 return billingService.getPriceConfig(routing.getUpstreamModel(), routing.getChannelId())
-                    .flatMapMany(priceConfig -> {
+                    .flatMap(priceConfig -> {
                         context.priceConfig = priceConfig;
 
                         return billingService.reserve(context.userId, requestId, priceConfig)
-                            .flatMapMany(reservedBalance -> {
+                            .flatMap(reservedBalance -> {
                                 // 关键修复：之前误传 null 导致流式请求的 request_headers/client_ip/user_agent 全部落空
                                 settlementService.recordRequestLogStart(requestId, context.userId, context.tokenId, routing, true, exchange);
 
                                 return resolveEndpointConfig(routing.getUpstreamModel(), routing.getChannelId())
-                                    .flatMapMany(endpointConfig -> {
+                                    .map(endpointConfig -> {
                                         log.info("[LlmGateway] 使用端点配置: baseUrl={}, endpointPath={}",
                                             endpointConfig.getBaseUrl() != null ? endpointConfig.getBaseUrl() : "(默认)",
                                             endpointConfig.getEndpointPath());
 
-                                        return executeStreamAndHandleBilling(context, endpointConfig);
+                                        return new PreparedStream(executeStreamAndHandleBilling(context, endpointConfig));
                                     });
                             });
                     });
