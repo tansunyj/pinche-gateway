@@ -1,9 +1,13 @@
 package com.llmate.multiprotocol.engine;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.llmate.multiprotocol.constant.SystemConstants;
 import com.llmate.multiprotocol.dto.*;
+import com.llmate.multiprotocol.dto.anthropic.CountTokensResponse;
 import com.llmate.multiprotocol.engine.provider.ProviderAdapter;
 import com.llmate.multiprotocol.engine.provider.ProviderRegistry;
+import com.llmate.multiprotocol.engine.provider.anthropic.AnthropicProviderAdapter;
 import com.llmate.multiprotocol.entity.ModelPricesEntity;
 import com.llmate.multiprotocol.entity.ProxyTokensEntity;
 import com.llmate.multiprotocol.exception.LlmErrorCode;
@@ -476,6 +480,37 @@ public class LlmGateway {
                     .httpMethod("POST")
                     .build());
             });
+    }
+
+    /**
+     * 路由并执行 Anthropic count_tokens（token 估算）查询。
+     *
+     * 路由与聊天接口完全一致：modelRouter.resolve 按渠道前缀（dream/claude-opus-5 → channel=dream）
+     * 解析渠道，再按 resolve 出的 channelCode 查对应渠道的 Provider —— 绝不写死某个固定渠道。
+     * count_tokens 是 Anthropic 独有接口，仅 Claude（Anthropic 原生）渠道支持；其他渠道（如 OpenAI
+     * 兼容）返回 MODEL_NOT_SUPPORTED 由异常处理器转 4xx，不会 fallback 到固定渠道。
+     * 不参与计费/预占/日志（纯估算，不产生真实用量）。
+     */
+    public Mono<CountTokensResponse> countTokens(String modelPath, JsonNode rawBody, ServerWebExchange exchange) {
+        return modelRouter.resolve(modelPath)
+            .flatMap(routing ->
+                findProviderAsync(routing.getChannelCode(), routing.getProviderAlias())
+                    .flatMap(provider -> {
+                        if (provider instanceof AnthropicProviderAdapter anthropic) {
+                            // count_tokens 透传前把 model 替换成上游真实模型名（如 claude-opus-5），
+                            // 否则带渠道前缀的 dream/claude-opus-5 上游不识别
+                            JsonNode upstreamBody = rawBody;
+                            if (rawBody != null && rawBody.isObject()) {
+                                upstreamBody = ((ObjectNode) rawBody.deepCopy()).put("model", routing.getUpstreamModel());
+                            }
+                            final JsonNode bodyToForward = upstreamBody;
+                            return resolveEndpointConfig(routing.getUpstreamModel(), routing.getChannelId())
+                                .flatMap(endpointConfig -> anthropic.countTokens(bodyToForward, endpointConfig));
+                        }
+                        log.warn("[LlmGateway] count_tokens 仅支持 Claude(Anthropic)渠道: model={}, channel={}, providerAlias={}",
+                            modelPath, routing.getChannelCode(), routing.getProviderAlias());
+                        return Mono.error(new LlmGatewayException(LlmErrorCode.MODEL_NOT_SUPPORTED, modelPath, "count_tokens"));
+                    }));
     }
 
     /**

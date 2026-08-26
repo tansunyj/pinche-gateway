@@ -5,8 +5,10 @@ import com.llmate.multiprotocol.constant.ProtocolType;
 import com.llmate.multiprotocol.annotation.RequireApiKey;
 import com.llmate.multiprotocol.converter.AnthropicProtocolConverter;
 import com.llmate.multiprotocol.dto.PreparedStream;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.llmate.multiprotocol.dto.anthropic.AnthropicMessagesRequest;
 import com.llmate.multiprotocol.dto.anthropic.AnthropicMessagesResponse;
+import com.llmate.multiprotocol.dto.anthropic.CountTokensResponse;
 import com.llmate.multiprotocol.engine.LlmGateway;
 import com.llmate.multiprotocol.engine.ProtocolManager;
 import lombok.extern.log4j.Log4j2;
@@ -78,6 +80,23 @@ public class AnthropicCompatibleController {
             return handleBlockingRequest(request, exchange)
                     .map(resp -> ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON).body(resp));
         }
+    }
+
+    /**
+     * Claude Code 的 POST /v1/messages/count_tokens：估算输入 tokens。
+     * 网关此前未实现该接口 → 404 → Claude Code 视为失败高频重试产生大量 429。
+     * 新增后把原始请求体透传上游，返回 {"input_tokens": N}；纯估算不参与计费。
+     */
+    @PostMapping(value = "/messages/count_tokens", produces = MediaType.APPLICATION_JSON_VALUE)
+    public Mono<ResponseEntity<CountTokensResponse>> countTokens(
+            @RequestBody JsonNode request,
+            ServerWebExchange exchange) {
+
+        protocolManager.bindProtocol(exchange, ProtocolType.ANTHROPIC_MESSAGES);
+        String model = request != null && request.path("model").isTextual() ? request.path("model").asText() : null;
+        log.info("[Anthropic-Controller] 收到 count_tokens 请求: model={}", model);
+        return gateway.countTokens(model, request, exchange)
+                .map(resp -> ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON).body(resp));
     }
 
     /**

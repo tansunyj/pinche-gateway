@@ -133,6 +133,48 @@ public class SettlementService {
     }
 
     /**
+     * 记录流式失败（中断）结算日志 —— BillingService.abortStream 专用。
+     * 与 {@link #recordStreamSettlementLog} 唯一区别：status="aborted" 且 aborted=1，
+     * 便于管理端区分「成功结算」与「流中途失败但已按已消耗 tokens 计费」。
+     */
+    public void recordStreamAbortLog(
+            String requestId,
+            Long userId,
+            Long tokenId,
+            ProxyTokensEntity tokenEntity,
+            RoutingResult routing,
+            UsageData usageData,
+            BillingResult costResult,
+            long latency) {
+
+        ProxyLogsEntity logsEntity = ProxyLogsEntity.builder()
+            .userId(userId)
+            .tokenId(tokenId)
+            .tokenName(tokenEntity != null ? tokenEntity.getTokenName() : null)
+            .channelId(routing.getChannelId())
+            .requestId(requestId)
+            .channelName(routing.getChannelCode())
+            // model 记录客户端原始模型ID（含渠道前缀，如 deepseek/deepseek-v4-flash）
+            .model(routing.getModelId())
+            .promptTokens((int) usageData.getInputTokens())
+            .completionTokens((int) usageData.getOutputTokens())
+            .quotaConsumed(costResult.getQuota())
+            .latencyMs((int) latency)
+            .status("aborted")
+            .isThinking(0)
+            .priceMarkup(costResult.getPackageMarkup())
+            // 车次折扣归属(§5.4)：候选全保留 + 折前原价(反推)
+            .discountRideIds(joinRideIds(costResult))
+            .originalQuota(reverseOriginalQuota(costResult))
+            .billingDetail(costResult.getBillingDetail())
+            .createdAt(LocalDateTime.now())
+            .aborted(1)
+            .build();
+
+        recordSettlement(logsEntity);
+    }
+
+    /**
      * 结算回填（部分 UPDATE，行已由 recordRequestLogStart 建好；罕见未建行则插入结算快照）。
      * 更新列集（结算字段）与完成回填（审计字段）不相交，避免并发整行覆盖。
      */

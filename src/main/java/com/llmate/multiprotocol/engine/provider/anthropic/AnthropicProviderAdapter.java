@@ -11,11 +11,14 @@ import com.llmate.multiprotocol.dto.ModelEndpointConfig;
 import com.llmate.multiprotocol.dto.anthropic.AnthropicMessagesRequest;
 import com.llmate.multiprotocol.dto.anthropic.AnthropicMessagesResponse;
 import com.llmate.multiprotocol.dto.anthropic.AnthropicStreamEvent;
+import com.llmate.multiprotocol.dto.anthropic.CountTokensResponse;
 import com.llmate.multiprotocol.engine.provider.AbstractProviderAdapter;
 import com.llmate.multiprotocol.engine.provider.ProviderAdapter;
 import com.llmate.multiprotocol.util.LogBox;
 import com.llmate.multiprotocol.util.UrlUtils;
 import com.llmate.multiprotocol.util.WebClientUtils;
+import com.fasterxml.jackson.databind.DeserializationFeature;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.extern.log4j.Log4j2;
 import org.springframework.http.HttpHeaders;
@@ -50,6 +53,13 @@ import java.util.List;
 public class AnthropicProviderAdapter implements ProviderAdapter {
 
     private static final String UPSTREAM_PATH = BusinessConstants.UPSTREAM_PATH_MESSAGES;
+    // 流式 SSE data 行解析用 ObjectMapper（只读线程安全，独立实例避免与主 objectMapper 混淆）。
+    // 必须关闭 FAIL_ON_UNKNOWN_PROPERTIES：上游事件带 DTO 没有的扩展字段（顶层 model、
+    // message.stop_details / delta.stop_details / usage.output_tokens_details 等），Jackson 默认
+    // 对未知字段抛 UnrecognizedPropertyException，会把所有合法事件当成垃圾跳过，导致流式正文与
+    // tokens 全丢。关闭后仅真正无法解析的尾部数组（START_ARRAY → MismatchedInputException）会被跳过。
+    private static final ObjectMapper SSE_MAPPER = new ObjectMapper()
+        .configure(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
     private final WebClient webClient;
     private final HttpClient httpClient;
     private final AnthropicFormatConverter formatConverter;
@@ -246,9 +256,16 @@ public class AnthropicProviderAdapter implements ProviderAdapter {
 
             return getCurrentWebClient().post()
                     .uri(targetUrl)
+                    .header(HttpHeaders.ACCEPT, MediaType.TEXT_EVENT_STREAM_VALUE)
                     .bodyValue(request)
                     .retrieve()
-                    .bodyToFlux(AnthropicStreamEvent.class)
+                    // 容错 SSE 解析：见 parseAnthropicSseEvent。中继类上游会在
+                    // message_stop 之后追加一个 data 为 JSON 数组的尾部事件，严格
+                    // bodyToFlux(AnthropicStreamEvent.class) 会抛 DecodingException 把整条流打成 error，
+                    // 导致网关不结算、客户端收不到 message_delta/message_stop、proxy_logs 无记录。
+                    // 改为按行解析，坏 data 直接跳过不中断流，让已消费 tokens 正常走结算。
+                    .bodyToFlux(String.class)
+                    .mapNotNull(this::parseAnthropicSseEvent)
                     .doOnNext(event -> log.debug("[Anthropic] 收到流式事件: type={}", event.getType()))
                     // 状态化累积 tool_use 参数：Anthropic 把 tool_use 的 input 以 input_json_delta 分段下发
                     //（partial_json 片段）。toInternalStreamChunk 是无状态逐事件转换，无法跨事件拼接；
@@ -352,6 +369,66 @@ public class AnthropicProviderAdapter implements ProviderAdapter {
             return UrlUtils.join(endpointConfig.getBaseUrl(), endpointConfig.getEndpointPath());
         }
         return UrlUtils.join(baseUrl, UPSTREAM_PATH);
+    }
+
+    /**
+     * Claude Code 的 POST /v1/messages/count_tokens：估算输入 tokens（不产生模型调用）。
+     *
+     * 网关此前未实现该接口 → 404 → Claude Code 视为失败高频重试，产生大量 429。
+     * 这里把原始请求体原样透传给上游（Anthropic 标准接口 /v1/messages/count_tokens），
+     * 取 input_tokens 返回。不参与计费/预占/日志（纯估算，不产生真实用量）。
+     */
+    public Mono<CountTokensResponse> countTokens(JsonNode rawBody, ModelEndpointConfig endpointConfig) {
+        String basePath = endpointConfig != null && endpointConfig.getBaseUrl() != null
+                && !endpointConfig.getBaseUrl().isEmpty()
+                ? endpointConfig.getBaseUrl() : baseUrl;
+        String countUrl = UrlUtils.join(basePath, "v1/messages/count_tokens");
+
+        return Mono.deferContextual(ctxView -> {
+            String requestId = ctxView.getOrDefault("requestId", "N/A");
+            Long userId = ctxView.getOrDefault("userId", null);
+            String model = rawBody != null && rawBody.path("model").isTextual()
+                    ? rawBody.path("model").asText() : null;
+            log.info("[Anthropic] count_tokens 请求: url={}, model={}", countUrl, model);
+            LogBox.logUpstreamRequest(providerName, countUrl, rawBody, requestId, userId);
+
+            return getCurrentWebClient().post()
+                    .uri(countUrl)
+                    .bodyValue(rawBody)
+                    .retrieve()
+                    .bodyToMono(CountTokensResponse.class)
+                    .doOnNext(resp -> log.info("[Anthropic] count_tokens 响应: input_tokens={}", resp.getInputTokens()))
+                    .doOnError(e -> logError("count_tokens", e));
+        });
+    }
+
+    /**
+     * 容错解析单条 SSE data 行（形如 data:{"type":"message_start",...}）。
+     *
+     * 与 OpenAI 渠道的 parseOpenAiCompatibleSse/safeReadValue 同一模式：
+     * - 兼容「data: 」前缀与裸 JSON 两种形态（Spring SSE 读取器按 data 内容给 String，不带前缀）；
+     * - 空行/注释/非对象（如 [DONE]）返回 null，由 mapNotNull 静默跳过；
+     * - Jackson 解析失败（典型：中继在 message_stop 后追加 data 为 JSON 数组的尾部事件）
+     *   返回 null 跳过，而不是把整条流以 error 结束——保证已消费 tokens 正常结算、客户端
+     *   能收到 message_delta/message_stop 收尾事件。
+     */
+    private AnthropicStreamEvent parseAnthropicSseEvent(String line) {
+        if (line == null) {
+            return null;
+        }
+        String json = line.trim();
+        if (json.startsWith("data:")) {
+            json = json.substring(5).trim();
+        }
+        if (json.isEmpty() || !json.startsWith("{")) {
+            return null;
+        }
+        try {
+            return SSE_MAPPER.readValue(json, AnthropicStreamEvent.class);
+        } catch (Exception e) {
+            log.warn("[Anthropic] 跳过无法解析的SSE事件(非标准尾部数据): {}", json);
+            return null;
+        }
     }
 
     private void logRequest(String mode, String requestUrl, AnthropicMessagesRequest request, String requestId, Long userId) {

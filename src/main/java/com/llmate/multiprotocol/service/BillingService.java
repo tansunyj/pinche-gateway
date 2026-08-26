@@ -396,13 +396,65 @@ public class BillingService {
     }
 
     /**
-     * 流式失败清理：释放预占 + 回填失败请求日志
+     * 流式失败清理：按已消耗 tokens 计费 + 释放剩余预占 + 回填失败日志。
+     *
+     * 修复背景：旧实现无论上游是否已产生用量都全额释放预占、不扣费、不写 proxy_logs。
+     * 中继类上游（如 dreamfly.art）按请求计费，若流中途失败（上游尾部异常事件/网络断开/
+     * 客户端取消），网关已收到的 tokens 成本无人承担，且 proxy_logs 无任何记录，与上游计费
+     * 对不上（管理端看不到这笔消耗）。现在：
+     * - 有实际用量（totalTokens>0）：与 settleStream 同链结算——按真实用量算价、释放预占、
+     *   扣减余额，写 proxy_logs(status=aborted, aborted=1) + proxy_request_logs(500) + 失败统计；
+     * - 无用量（上游未产生任何 tokens）：维持原行为（全额释放 + 仅回填失败请求日志）。
      */
     public void abortStream(BillingContext ctx, UsageData usageData, long latency, long firstChunkLatencyMs, Throwable e, int chunkCount) {
-        release(ctx.getUserId(), ctx.getRequestId()).subscribe();
-        settlementService.recordStreamRequestLogComplete(
-            ctx.getRequestId(), usageData, null, latency, firstChunkLatencyMs, 500,
-            e != null ? e.getMessage() : "stream aborted", chunkCount);
+        boolean hasUsage = usageData != null && usageData.getTotalTokens() > 0;
+        if (!hasUsage) {
+            release(ctx.getUserId(), ctx.getRequestId()).subscribe();
+            settlementService.recordStreamRequestLogComplete(
+                ctx.getRequestId(), usageData, null, latency, firstChunkLatencyMs, 500,
+                e != null ? e.getMessage() : "stream aborted", chunkCount);
+            return;
+        }
+
+        String upstreamModel = ctx.getRouting().getUpstreamModel();
+        buildBillingParams(ctx.getPriceConfig(), ctx.getTokenEntity(), upstreamModel, ctx.getRouting().getModelId())
+            .flatMap(billingParams ->
+                billingCalculator.calculateCost(
+                        ctx.getPriceConfig().getBillingMode(),
+                        usageData,
+                        billingParams,
+                        "USD",
+                        ctx.getRequestId(),
+                        ctx.getUserId(),
+                        upstreamModel)
+                    .flatMap(costResult ->
+                        // 先释放预占，再按实际用量扣减（避免预占泄漏，与 settleStream 一致）
+                        release(ctx.getUserId(), ctx.getRequestId())
+                            .then(deduct(ctx.getUserId(), ctx.getRequestId(), costResult.getQuota()))
+                            .map(newBalance -> costResult))
+            )
+            .doOnSuccess(costResult -> {
+                settlementService.recordStreamAbortLog(
+                    ctx.getRequestId(), ctx.getUserId(), ctx.getTokenId(), ctx.getTokenEntity(),
+                    ctx.getRouting(), usageData, costResult, latency);
+                settlementService.recordStreamRequestLogComplete(
+                    ctx.getRequestId(), usageData, costResult, latency, firstChunkLatencyMs, 500,
+                    e != null ? e.getMessage() : "stream aborted", chunkCount);
+                // 记录统计（失败态）
+                recordStats(ctx, usageData, costResult, latency, false, "stream");
+                log.warn("[BillingService] 流式失败已按实际用量结算: requestId={}, quota={}, totalTokens={}",
+                    ctx.getRequestId(), costResult.getQuota(), usageData.getTotalTokens());
+            })
+            .doOnError(err -> {
+                log.error("[BillingService] 流式失败结算失败: requestId={}", ctx.getRequestId(), err);
+                settlementService.recordStreamRequestLogComplete(
+                    ctx.getRequestId(), usageData, null, latency, firstChunkLatencyMs, 500,
+                    e != null ? e.getMessage() : "stream aborted", chunkCount);
+                // 结算失败兜底：释放预占（幂等）
+                release(ctx.getUserId(), ctx.getRequestId()).subscribe();
+            })
+            .contextWrite(c -> c.put(SystemConstants.CONTEXT_REQUEST_ID_KEY, ctx.getRequestId()))
+            .subscribe(v -> {}, err -> {});
     }
 
     // ==================== 内部工具方法 ====================
