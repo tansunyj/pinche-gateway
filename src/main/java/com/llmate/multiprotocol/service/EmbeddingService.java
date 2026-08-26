@@ -15,6 +15,7 @@ import com.llmate.multiprotocol.exception.LlmErrorCode;
 import com.llmate.multiprotocol.exception.LlmGatewayException;
 import com.llmate.multiprotocol.repository.ProxyChannelTokensRepository;
 import com.llmate.multiprotocol.repository.ProxyChannelsRepository;
+import com.llmate.multiprotocol.util.KeyMaskUtil;
 import com.llmate.multiprotocol.util.LogBox;
 import com.llmate.multiprotocol.util.UserContext;
 import com.llmate.multiprotocol.util.WebClientUtils;
@@ -158,7 +159,8 @@ public class EmbeddingService {
 
                                 // 5. 调上游并透传
                                 Map<String, Object> upstreamBody = bodyBuilder.apply(pureModelId);
-                                return callUpstream(channel, upstreamBody, requestId, userId)
+                                return callUpstream(channel, upstreamBody, requestId, userId,
+                                        tokenId, tokenEntity != null ? tokenEntity.getApiKey() : null)
                                     .flatMap(response -> {
                                         long latency = System.currentTimeMillis() - startTime;
                                         // 6. 解析 usage 并结算（内联 await，与聊天/生图一致）：
@@ -210,7 +212,7 @@ public class EmbeddingService {
                                     LlmErrorCode.CHANNEL_TOKEN_EXHAUSTED, "向量模型渠道API Key未配置，模型: " + originalModelId)))
                             .map(token -> new ChannelInfo(
                                     channel.getChannelCode(), channelId, channel.getBaseUrl(),
-                                    endpointPath, token.getApiKeyEncrypted())));
+                                    endpointPath, token.getApiKeyEncrypted(), token.getId())));
             });
     }
 
@@ -220,7 +222,7 @@ public class EmbeddingService {
      * 调用向量上游接口（反应式，不 block；带 ==== 方框请求/响应日志）
      */
     private Mono<JsonNode> callUpstream(ChannelInfo channel, Map<String, Object> upstreamBody,
-                                        String requestId, Long userId) {
+                                        String requestId, Long userId, Long userTokenId, String userApiKey) {
         String baseUrl = channel.baseUrl().endsWith("/")
                 ? channel.baseUrl().substring(0, channel.baseUrl().length() - 1)
                 : channel.baseUrl();
@@ -231,6 +233,9 @@ public class EmbeddingService {
 
         log.info("[Embedding] 上游请求: url={}", url);
         LogBox.logUpstreamRequest(channel.channelCode(), url, upstreamBody, requestId, userId);
+        // 调用上游接口前打印本次使用的 用户/渠道 API Key（ID + 首尾遮罩），便于排查
+        log.info("[Embedding] 调用上游 keys: {}",
+            KeyMaskUtil.describeKeys(userTokenId, userApiKey, channel.tokenId(), channel.apiKey()));
 
         return webClient.post()
             .uri(url)
@@ -380,9 +385,10 @@ public class EmbeddingService {
     }
 
     /**
-     * 渠道信息（baseUrl / endpointPath / apiKey / channelId / channelCode）
+     * 渠道信息（baseUrl / endpointPath / apiKey / tokenId / channelId / channelCode）
+     * tokenId = 该渠道实际使用的渠道 Token ID（取启用的首个渠道 Token）
      */
     private record ChannelInfo(String channelCode, Long channelId, String baseUrl,
-                               String endpointPath, String apiKey) {
+                               String endpointPath, String apiKey, Long tokenId) {
     }
 }

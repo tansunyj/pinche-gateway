@@ -114,6 +114,8 @@ public abstract class OpenAiCompatibleAdapter extends AbstractProviderAdapter {
                 : UrlUtils.join(baseUrl, uri);
 
         logRequest("非流式", fullUrl, openAiReq);
+        // 调用上游接口前打印本次使用的 用户/渠道 API Key（ID + 首尾遮罩），便于排查
+        logUpstreamKeys(internalReq, "非流式");
 
         // 部分上游(如兴鼎 xdwl)即使收到 stream:false 也可能返回 text/event-stream；
         // doPostBlocking 的 bodyToMono 读 SSE 会抛 UnsupportedOperationException(SSE 只能以 Flux 读)，
@@ -157,6 +159,8 @@ public abstract class OpenAiCompatibleAdapter extends AbstractProviderAdapter {
                 : UrlUtils.join(baseUrl, uri);
 
         logRequest("流式", fullUrl, openAiReq);
+        // 调用上游接口前打印本次使用的 用户/渠道 API Key（ID + 首尾遮罩），便于排查
+        logUpstreamKeys(internalReq, "流式");
 
         // 状态化累积 tool_call 参数：OpenAI 把 arguments 以 delta.tool_calls[].function.arguments
         // 增量片段下发（首块带 name/id、后续只有参数片段）。toInternalStreamChunk 无状态逐事件转换，

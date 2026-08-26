@@ -91,6 +91,8 @@ public class VolcengineVideoAdapter extends AbstractProviderAdapter {
             String url = UrlUtils.join(baseUrl, SUBMIT_PATH);
 
             LogBox.logUpstreamRequest(getProviderName(), url, maskForLog(body), requestId, userId);
+            // 调用上游接口前打印本次使用的 用户/渠道 API Key（ID + 首尾遮罩），便于排查
+            logUpstreamKeys(request, "生视频");
 
             return webClient.post()
                     .uri(relativePath)

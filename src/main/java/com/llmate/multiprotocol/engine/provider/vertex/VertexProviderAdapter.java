@@ -12,6 +12,7 @@ import com.llmate.multiprotocol.dto.vertex.VertexGenerateContentResponse;
 import com.llmate.multiprotocol.engine.provider.ProviderAdapter;
 import com.llmate.multiprotocol.exception.LlmErrorCode;
 import com.llmate.multiprotocol.exception.LlmGatewayException;
+import com.llmate.multiprotocol.util.KeyMaskUtil;
 import com.llmate.multiprotocol.util.LogBox;
 import com.llmate.multiprotocol.util.UrlUtils;
 import com.llmate.multiprotocol.util.WebClientUtils;
@@ -146,11 +147,33 @@ public class VertexProviderAdapter implements ProviderAdapter {
     /**
      * 获取当前 WebClient（根据选择的 Token）
      */
-    private WebClient getCurrentWebClient() {
+    /**
+     * 获取当前 WebClient（根据选择的 Token）
+     * 在【调用上游接口前】打印本次使用的 用户 API Key 与 渠道 API Key 的 ID + 首尾遮罩（KeyMaskUtil.mask），
+     * 便于按 requestId/tokenId 排查问题，绝不打印完整 key。
+     *
+     * @param internalReq 内部请求（携带 LlmGateway 填充的用户 key 信息）
+     */
+    private WebClient getCurrentWebClient(LlmChatRequest internalReq) {
         String selectedKey = selectApiKey();
         if (selectedKey != null) {
+            // 多 Token 负载均衡：打印本轮实际选中的渠道 Token
+            log.info("[{}] 调用上游 keys: {}",
+                getProviderName(),
+                KeyMaskUtil.describeKeys(
+                    internalReq != null ? internalReq.getUserTokenId() : null,
+                    internalReq != null ? internalReq.getUserApiKey() : null,
+                    currentTokenId.get(), selectedKey));
             return buildWebClient(selectedKey);
         }
+        // 单 Token 模式：用构造时配置的默认 key（apiKeys.get(0)，与 webClient 认证 Header 一致）
+        log.info("[{}] 调用上游 keys: {}",
+            getProviderName(),
+            KeyMaskUtil.describeKeys(
+                internalReq != null ? internalReq.getUserTokenId() : null,
+                internalReq != null ? internalReq.getUserApiKey() : null,
+                tokenIds.isEmpty() ? null : tokenIds.get(0),
+                apiKeys.isEmpty() ? null : apiKeys.get(0)));
         return webClient;
     }
 
@@ -257,7 +280,7 @@ public class VertexProviderAdapter implements ProviderAdapter {
             Long userId = ctxView.getOrDefault("userId", null);
             logRequest("非流式", requestUrl, request, requestId, userId);
 
-            return getCurrentWebClient().post()
+            return getCurrentWebClient(internalReq).post()
                     .uri(requestUrl)
                     .bodyValue(request)
                     .retrieve()
@@ -310,7 +333,7 @@ public class VertexProviderAdapter implements ProviderAdapter {
             Long userId = ctxView.getOrDefault("userId", null);
             logRequest("流式", requestUrl, request, requestId, userId);
 
-            return getCurrentWebClient().post()
+            return getCurrentWebClient(internalReq).post()
                 .uri(requestUrl)
                 .bodyValue(request)
                 .accept(MediaType.TEXT_EVENT_STREAM) // SSE 格式：上游返回 data: {...} 事件流

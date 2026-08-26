@@ -106,6 +106,8 @@ public class OpenAiImageAdapter extends AbstractProviderAdapter {
         ModelEndpointConfig effective = resolveModelPlaceholder(endpointConfig, request.getModel());
         Map<String, Object> body = buildGenerationBody(request);
         logRequest("图像生成", fullUrl(effective, GEN_PATH), body);
+        // 调用上游接口前打印本次使用的 用户/渠道 API Key（ID + 首尾遮罩），便于排查
+        logUpstreamKeys(request, "图像生成");
 
         // doPostBlocking 内部优先使用 endpointConfig.getFullUrl()（DB 解析结果），
         // 无配置时退回 uri=GEN_PATH 相对 baseUrl 拼接
@@ -137,6 +139,8 @@ public class OpenAiImageAdapter extends AbstractProviderAdapter {
                 MultipartBodyBuilder mb = buildEditMultipart(request, p, resolved, isAzure);
                 String logSummary = buildMultipartLogSummary(request, resolved, p, isAzure);
                 logRequest("图像编辑", effective.getFullUrl(), logSummary);
+                // 调用上游接口前打印本次使用的 用户/渠道 API Key（ID + 首尾遮罩），便于排查
+                logUpstreamKeys(request, "图像编辑");
                 return postMultipart(mb, effective, logSummary);
             })
             .doOnNext(resp -> log.info("[{}] 图像编辑完成: images={}", getProviderName(),

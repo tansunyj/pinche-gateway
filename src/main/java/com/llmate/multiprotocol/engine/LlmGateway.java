@@ -162,6 +162,11 @@ public class LlmGateway {
                         Long tokenId = UserContext.getTokenId(exchange);
                         ProxyTokensEntity tokenEntity = UserContext.getTokenEntity(exchange);
 
+                        // 把用户 API Key 的 ID + 明文传递到 Provider 层，供"调用上游接口"时打印
+                        // 首尾遮罩日志（KeyMaskUtil.mask），只入日志绝不上游/落库。
+                        internalRequest.setUserTokenId(tokenId);
+                        internalRequest.setUserApiKey(tokenEntity != null ? tokenEntity.getApiKey() : null);
+
                         // 1. 获取模型价格配置
                         return billingService.getPriceConfig(routing.getUpstreamModel(), routing.getChannelId())
                             .flatMap(priceConfig ->
@@ -309,6 +314,10 @@ public class LlmGateway {
         context.userId = UserContext.getUserId(exchange);
         context.tokenId = UserContext.getTokenId(exchange);
         context.tokenEntity = UserContext.getTokenEntity(exchange);
+
+        // 把用户 API Key 的 ID + 明文传递到 Provider 层，供"调用上游接口"时打印首尾遮罩日志
+        context.internalRequest.setUserTokenId(context.tokenId);
+        context.internalRequest.setUserApiKey(context.tokenEntity != null ? context.tokenEntity.getApiKey() : null);
 
         // 响应式获取 Provider（支持懒加载：新增渠道首次访问自动从 DB 加载并注册到内存）
         return findProviderAsync(routing.getChannelCode(), routing.getProviderAlias())

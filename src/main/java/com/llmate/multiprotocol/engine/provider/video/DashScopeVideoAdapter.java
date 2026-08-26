@@ -90,6 +90,8 @@ public class DashScopeVideoAdapter extends AbstractProviderAdapter {
 
             // 上游请求日志（body 经 maskForLog 脱敏，base64 大段变占位符）
             LogBox.logUpstreamRequest(getProviderName(), url, maskForLog(body), requestId, userId);
+            // 调用上游接口前打印本次使用的 用户/渠道 API Key（ID + 首尾遮罩），便于排查
+            logUpstreamKeys(request, "生视频");
 
             // 生视频提交必须带 X-DashScope-Async: enable（异步任务头），doPostBlocking 不支持额外 header，
             // 这里用 mutate 后独立 WebClient 发送，保留 Bearer 认证 + 大响应缓冲。

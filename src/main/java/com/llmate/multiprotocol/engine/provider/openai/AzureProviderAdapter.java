@@ -94,6 +94,8 @@ public class AzureProviderAdapter extends OpenAiCompatibleAdapter {
                 ? endpointConfig.getEndpointPath()
                 : DEFAULT_PATH;
         logRequest("流式", UrlUtils.join(baseUrl, uri), openAiReq);
+        // 调用上游接口前打印本次使用的 用户/渠道 API Key（ID + 首尾遮罩），便于排查
+        logUpstreamKeys(internalReq, "流式");
 
         return doPostStreamRaw(uri, openAiReq, endpointConfig)
                 .flatMap(rawLine -> {

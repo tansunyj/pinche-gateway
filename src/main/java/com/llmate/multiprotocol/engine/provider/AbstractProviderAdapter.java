@@ -4,10 +4,12 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.llmate.multiprotocol.constant.SystemConstants;
+import com.llmate.multiprotocol.dto.LlmChatRequest;
 import com.llmate.multiprotocol.dto.LlmChatResponse;
 import com.llmate.multiprotocol.dto.ModelEndpointConfig;
 import com.llmate.multiprotocol.exception.LlmErrorCode;
 import com.llmate.multiprotocol.exception.LlmGatewayException;
+import com.llmate.multiprotocol.util.KeyMaskUtil;
 import com.llmate.multiprotocol.util.LogBox;
 import com.llmate.multiprotocol.util.UrlUtils;
 import com.llmate.multiprotocol.util.WebClientUtils;
@@ -181,6 +183,27 @@ public abstract class AbstractProviderAdapter implements ProviderAdapter {
     protected void clearCurrentToken() {
         currentApiKey.remove();
         currentTokenId.remove();
+    }
+
+    /**
+     * 打印"调用上游接口时"使用的 用户 API Key 与 渠道 API Key 的排查日志：
+     * ID + 首尾保留、中间星号遮罩（KeyMaskUtil.mask），便于对 requestId/tokenId 定位问题，绝不打印完整 key。
+     *
+     * OpenAI 兼容系渠道：WebClient 的认证 Header 在构造时用【首个 Token】固定
+     * （ProviderFactory 取 config.getApiKey() = apiKeys.get(0)），当前不按请求轮换，
+     * 因此渠道 Token ID 与 Key 取 tokenIds/apiKeys 首个。
+     *
+     * @param req 内部请求（携带 LlmGateway 填充的用户 key 信息；可为 null，如 count_tokens 透传）
+     * @param label 请求类型，如 "非流式" / "流式"
+     */
+    protected void logUpstreamKeys(LlmChatRequest req, String label) {
+        log.info("[{}] 调用上游 keys ({}): {}",
+            getProviderName(), label,
+            KeyMaskUtil.describeKeys(
+                req != null ? req.getUserTokenId() : null,
+                req != null ? req.getUserApiKey() : null,
+                tokenIds.isEmpty() ? null : tokenIds.get(0),
+                apiKeys.isEmpty() ? null : apiKeys.get(0)));
     }
 
     // ==================== 公共骨架方法 ====================

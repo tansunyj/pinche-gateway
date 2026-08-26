@@ -8,6 +8,7 @@ import com.llmate.multiprotocol.exception.LlmErrorCode;
 import com.llmate.multiprotocol.exception.LlmGatewayException;
 import com.llmate.multiprotocol.service.ApiKeyAuthService;
 import com.llmate.multiprotocol.service.UserUsersService;
+import com.llmate.multiprotocol.util.KeyMaskUtil;
 import com.llmate.multiprotocol.util.UserContext;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.log4j.Log4j2;
@@ -90,9 +91,11 @@ public class ApiKeyAuthWebFilter implements WebFilter {
                 // 绝不能放在整条链（含 chain.filter）之后：chain.filter() 返回 Mono<Void>，
                 // 业务成功执行完即"空完成"，会把成功误判为空结果（见下）。
                 return apiKeyAuthService.validateApiKey(apiKey)
-                    .switchIfEmpty(Mono.defer(() ->
-                        Mono.error(new LlmGatewayException(LlmErrorCode.AUTH_INVALID_KEY, "无效的 API Key"))
-                    ))
+                    .switchIfEmpty(Mono.defer(() -> {
+                        // 排查"无效的 API Key"时打印被拒 key 的遮罩首尾，便于对上日志/库里 key
+                        log.warn("[API Key 认证失败] 无效的 API Key: key={}", KeyMaskUtil.mask(apiKey));
+                        return Mono.error(new LlmGatewayException(LlmErrorCode.AUTH_INVALID_KEY, "无效的 API Key"));
+                    }))
                     .flatMap(token -> {
                         // 5. 检查 API Key 状态（同步检查，失败直接抛异常会被 catch 捕获转 error）
                         try {
@@ -107,8 +110,8 @@ public class ApiKeyAuthWebFilter implements WebFilter {
                         // 这样 chain.filter 的 Mono<Void> 空完成不会被误判为"用户不存在"。
                         return userUsersService.findById(token.getUserId())
                             .switchIfEmpty(Mono.defer(() -> {
-                                log.warn("[API Key 认证] 用户不存在: tokenId={}, userId={}",
-                                    token.getId(), token.getUserId());
+                                log.warn("[API Key 认证] 用户不存在: tokenId={}, userId={}, key={}",
+                                    token.getId(), token.getUserId(), KeyMaskUtil.mask(token.getApiKey()));
                                 return Mono.error(new LlmGatewayException(
                                     LlmErrorCode.AUTH_FAILED, "用户不存在"));
                             }))
@@ -135,13 +138,15 @@ public class ApiKeyAuthWebFilter implements WebFilter {
     private void checkTokenStatus(ServerWebExchange exchange, ProxyTokensEntity token) {
         // 检查是否禁用
         if (token.getStatus() == null || token.getStatus() != SystemConstants.STATUS_ENABLED) {
-            log.warn("[API Key 认证] API Key 已禁用: tokenId={}", token.getId());
+            log.warn("[API Key 认证] API Key 已禁用: tokenId={}, key={}",
+                token.getId(), KeyMaskUtil.mask(token.getApiKey()));
             throw new LlmGatewayException(LlmErrorCode.AUTH_INVALID_KEY, "API Key 已被禁用");
         }
 
         // 检查是否过期
         if (token.getExpiredAt() != null && token.getExpiredAt().isBefore(LocalDateTime.now())) {
-            log.warn("[API Key 认证] API Key 已过期: tokenId={}", token.getId());
+            log.warn("[API Key 认证] API Key 已过期: tokenId={}, key={}",
+                token.getId(), KeyMaskUtil.mask(token.getApiKey()));
             throw new LlmGatewayException(LlmErrorCode.AUTH_KEY_EXPIRED, token.getExpiredAt().toString());
         }
     }
@@ -231,7 +236,8 @@ public class ApiKeyAuthWebFilter implements WebFilter {
         // 将用户信息存入 exchange attribute，供后续使用
         exchange.getAttributes().put("user", user);
 
-        log.debug("[API Key 认证成功] userId={}, tokenId={}, nickname={}",
-            token.getUserId(), token.getId(), user.getNickname());
+        // INFO：用户 API Key 认证成功，打印 ID + 首尾遮罩 key，便于排查每次请求用哪个用户 key
+        log.info("[API Key 认证成功] userId={}, tokenId={}, userKey={}, nickname={}",
+            token.getUserId(), token.getId(), KeyMaskUtil.mask(token.getApiKey()), user.getNickname());
     }
 }

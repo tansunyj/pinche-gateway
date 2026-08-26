@@ -1,9 +1,12 @@
 package com.llmate.multiprotocol.dto;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
+import lombok.EqualsAndHashCode;
 import lombok.NoArgsConstructor;
+import lombok.ToString;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -82,4 +85,16 @@ public class LlmChatRequest {
 
     /** 渠道代码 */
     private String channelCode;
+
+    // ========== 调用上游时的 API Key 排查信息（仅内部传递，不参与任何上游序列化）==========
+
+    /** 用户 API Key 的 ID（proxy_tokens.id），由 LlmGateway 从认证上下文填充 */
+    @JsonIgnore
+    private Long userTokenId;
+
+    /** 用户 API Key 明文（proxy_tokens.api_key），仅供日志首尾遮罩显示，禁止落库/入上游请求 */
+    @JsonIgnore
+    @ToString.Exclude
+    @EqualsAndHashCode.Exclude
+    private String userApiKey;
 }

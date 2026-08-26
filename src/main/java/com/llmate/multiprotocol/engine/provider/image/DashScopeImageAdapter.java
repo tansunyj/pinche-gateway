@@ -144,6 +144,8 @@ public class DashScopeImageAdapter extends AbstractProviderAdapter {
                 return body;
             })
             .doOnNext(body -> log.info("[{}] 请求地址: POST {}", getProviderName(), effective.getFullUrl()))
+            // 调用上游接口前打印本次使用的 用户/渠道 API Key（ID + 首尾遮罩），便于排查
+            .doOnNext(body -> logUpstreamKeys(request, edit ? "图像编辑" : "图像生成"))
             .flatMap(body -> doPostBlocking(DEFAULT_PATH, body, JsonNode.class, json -> parseResponse(json, request), effective))
             .flatMap(resp -> maybeDownloadToBase64(resp, request))
             .doOnNext(resp -> log.info("[{}] 图像{}完成: images={}", getProviderName(),
