@@ -63,6 +63,22 @@ public class BillingService {
     private final ObjectMapper objectMapper;
     private final TimeBasedPricingService timeBasedPricingService;
 
+    /**
+     * 免费模型判定覆盖的全部价格 key（billing_params JSON，与 {@link #buildBillingParams} 读取口径一致，
+     * 另含 8 个视频 token 档位 key）。任一 key 显式配置 >0 → 非免费模型。
+     */
+    private static final String[] FREE_MODEL_PRICE_KEYS = {
+            "input_per_1m", "output_per_1m",
+            "thinking_output_per_m", "reasoning_per_1m", "cache_hit_per_1m",
+            "text_tokens_per_1m", "image_tokens_per_1m", "vector_tokens_per_1m",
+            "characters_per_1k",
+            "input_text_per_1m", "input_image_per_1m", "output_text_per_1m", "output_image_per_1m",
+            "image_per_call", "flat_price",
+            "video_per_second_720p", "video_per_second_1080p", "audio_per_second",
+            "480p_noInput", "480p_withInput", "720p_noInput", "720p_withInput",
+            "1080p_noInput", "1080p_withInput", "4k_noInput", "4k_withInput"
+    };
+
     // ==================== 价格配置 ====================
 
     /**
@@ -70,11 +86,12 @@ public class BillingService {
      *
      * 关键安全修复：渠道专属 + 全局都查不到价格时，直接抛 {@link LlmErrorCode#PRICE_NOT_CONFIGURED}
      * 拒绝本次调用，绝不兜底成全 0 价格 —— 否则未配价的模型会被静默 0 元计费（可被用户白嫖）。
+     * 「没有价格行」与「价格全为 0 的免费模型」是两回事：前者仍拒绝，后者由管理员显式配置放行。
      *
      * 在查到价格实体后追加 {@link #validateTokenPrices} 预检：token 类计费模式若「全无可用 token 单价」
-     * （维度价与同侧主价全部 ≤0），在调用上游前就拒绝（PRICE_NOT_CONFIGURED，HTTP 400），
-     * 杜绝「有使用量却按 0 计费」的费用缺失（与 {@link BillingCalculator#resolveTokenPrice} 的
-     * 仅同侧兜底规则配套）。
+     * 且非免费模型，在调用上游前就拒绝（PRICE_NOT_CONFIGURED，HTTP 400），杜绝「有使用量却按 0 计费」
+     * 的费用缺失（与 {@link BillingCalculator#resolveTokenPrice} 的仅同侧兜底规则配套）；
+     * 全部价格 = 0 的免费模型则预检放行（0 计费，预占仍按统一门槛）。
      */
     public Mono<ModelPricesEntity> getPriceConfig(String modelId, Long channelId) {
         return modelPricesRepository.findByModelIdAndChannelId(modelId, channelId)
@@ -84,11 +101,15 @@ public class BillingService {
     }
 
     /**
-     * token 类计费模式的「全无价格可兜」预检（用户确认规则：全 0 时拒绝请求而非静默免费）。
+     * token 类计费模式的「全无价格可兜」预检。
      *
      * 计费计算时每个 token 维度已做「仅同侧兜底」（维度价 → 同侧主价），此预检在上游调用前拦截
-     * 「整个模式没有任何可用 token 单价」的模型（billing_params 为空 / 全 0 / 只配了无关字段），
+     * 「整个模式没有任何可用 token 单价」的模型（billing_params 为空 / 只配了无关字段），
      * 让客户端收到干净的 400 错误，而不是先调上游再在结算时拒扣（白嫖）。
+     *
+     * 例外：billing_params 显式配置的每个价格 key 均为 0（「全部为 0」）＝ 管理员明确设置的
+     * 免费模型 → 预检放行（0 计费，预占仍按统一门槛，见 BillingCalculator#calculateCost / reserve）。
+     * 未配任何价格（null/空）仍按 PRICE_NOT_CONFIGURED 拒绝 —— 那不是"免费"，是漏配。
      *
      * 各模式判定（真实请求必然产生对应侧的用量，故按侧要求）：
      * - token       ：输入/输出两个主价(input/output_per_1m)都须 >0（对话必然同时有输入+输出）；
@@ -116,7 +137,13 @@ public class BillingService {
         if (usable) {
             return Mono.just(config);
         }
-        log.warn("[BillingService] 价格预检拒绝: modelId={}, billingMode={}, billing_params 无可用 token 单价(全部≤0)，拒绝调用",
+        // 全部价格 = 0 → 免费模型：预检放行（费用 0）
+        if (isFreeModel(config)) {
+            log.info("[BillingService] 免费模型(全部价格=0): modelId={}, billingMode={}, 预检放行, 0 计费",
+                modelId, config.getBillingMode());
+            return Mono.just(config);
+        }
+        log.warn("[BillingService] 价格预检拒绝: modelId={}, billingMode={}, billing_params 无可用 token 单价且非免费模型，拒绝调用",
             modelId, config.getBillingMode());
         return Mono.error(new LlmGatewayException(LlmErrorCode.PRICE_NOT_CONFIGURED, modelId));
     }
@@ -160,6 +187,11 @@ public class BillingService {
     /**
      * 预占余额（内部先估算额度再预占；异常统一转换为网关错误码）
      * BALANCE_INSUFFICIENT 透传，其余映射为 BALANCE_RESERVE_FAILED
+     *
+     * 免费模型（全部价格 = 0）同样走统一预占门槛：余额低于预占额度（如 0 余额）的用户
+     * 一律 BALANCE_INSUFFICIENT 拒绝，不可调用任何模型。「免费」只体现在费用计算为 0，
+     * 不豁免预占（产品规则：0 余额用户不允许调用任何模型，含免费模型）。
+     * 用户是否 ACTIVE 已由 ApiKeyAuthWebFilter 在鉴权阶段拦截。
      */
     public Mono<Long> reserve(Long userId, String requestId, ModelPricesEntity priceConfig) {
         if (userId == null) {
@@ -208,6 +240,10 @@ public class BillingService {
      */
     private Mono<Long> deduct(Long userId, String requestId, long amount) {
         if (userId == null) {
+            return Mono.just(0L);
+        }
+        // 0 额度（免费模型 / 未配价维度费用为 0）无需扣减：避免空走 Redis 原子减 + DB 相对扣减
+        if (amount <= 0) {
             return Mono.just(0L);
         }
         return userBalanceService.deductBalance(userId, requestId, amount);
@@ -475,6 +511,39 @@ public class BillingService {
             log.warn("[BillingService] 解析 billingParams 失败: {}", e.getMessage());
         }
         return BigDecimal.ZERO;
+    }
+
+    /**
+     * 免费模型判定（基于 billing_params JSON）：显式配置过 ≥1 个价格 key 且全部 ≤ 0。
+     *
+     * 「全部为 0」= 管理员显式配置的免费模型 → 允许调用（0 计费，预占仍按统一门槛）。
+     * billing_params 为 null / 空对象 / 不含任何价格 key / JSON 解析失败 → 返回 false：
+     * 那是「未配价」而非「全部为 0 的免费模型」，token 类模式仍由 {@link #validateTokenPrices}
+     * 按 PRICE_NOT_CONFIGURED 拒绝（防白嫖），与 {@link BillingParams#isFreeModel} 口径一致。
+     *
+     * @param config 模型价格实体（含 billing_params JSON）
+     * @return true = 免费模型
+     */
+    private boolean isFreeModel(ModelPricesEntity config) {
+        if (config == null || config.getBillingParams() == null) {
+            return false;
+        }
+        try {
+            JsonNode root = objectMapper.readTree(config.getBillingParams());
+            boolean hasPriceKey = false;
+            for (String k : FREE_MODEL_PRICE_KEYS) {
+                if (root.has(k) && !root.get(k).isNull()) {
+                    hasPriceKey = true;
+                    if (new BigDecimal(root.get(k).asText()).compareTo(BigDecimal.ZERO) > 0) {
+                        return false;
+                    }
+                }
+            }
+            return hasPriceKey;
+        } catch (Exception e) {
+            log.warn("[BillingService] 解析 billingParams 判定免费模型失败, 按非免费处理: {}", e.getMessage());
+            return false;
+        }
     }
 
     /**

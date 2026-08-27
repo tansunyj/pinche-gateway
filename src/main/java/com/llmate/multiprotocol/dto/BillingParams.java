@@ -89,4 +89,57 @@ public class BillingParams {
         if (videoTokenPrices == null) return null;
         return videoTokenPrices.get(key);
     }
+
+    /**
+     * 免费模型判定：至少显式配置了一个价格字段（或视频/模态价格 map 非空），
+     * 且所有非 null 价格字段与所有 map 值均 ≤ 0。
+     *
+     * 「全部为 0」= 管理员显式配置的免费模型：计费按 0；预占/余额门槛与正常模型一致
+     * （0 余额用户不可调用任何模型，含免费模型）。
+     * 与 {@code BillingService.isFreeModel(ModelPricesEntity)}（基于 billing_params JSON）口径一致。
+     * 全部字段为 null 且 map 为空 → 返回 false：那不是「全部为 0 的免费模型」，而是未配价，
+     * 由价格预检 validateTokenPrices 在 token 类模式拒绝（防白嫖）。
+     * 注意：priceMarkup（折扣倍率）/ rideIds / effectiveRideId / effectiveRideName / modelId
+     * 不是价格维度，不参与判定。
+     *
+     * @return true = 免费模型
+     */
+    public boolean isFreeModel() {
+        BigDecimal[] priceFields = {
+            inputPer1m, outputPer1m, cacheHitPer1m, reasoningPer1m,
+            imagePerCall, inputTextPer1m, inputImagePer1m, outputTextPer1m, outputImagePer1m,
+            videoPerSecond720p, videoPerSecond1080p,
+            textTokensPer1m, imageTokensPer1m, vectorTokensPer1m,
+            charactersPer1k, flatPrice, audioPerSecond
+        };
+        boolean hasAnyPrice = false;
+        for (BigDecimal p : priceFields) {
+            if (p != null) {
+                hasAnyPrice = true;
+                if (p.compareTo(BigDecimal.ZERO) > 0) {
+                    return false;
+                }
+            }
+        }
+        if (!hasAnyPrice && isEmptyMap(videoTokenPrices) && isEmptyMap(modalityPrices)) {
+            return false;
+        }
+        return allMapValuesNonPositive(videoTokenPrices) && allMapValuesNonPositive(modalityPrices);
+    }
+
+    private boolean isEmptyMap(Map<String, BigDecimal> map) {
+        return map == null || map.isEmpty();
+    }
+
+    private boolean allMapValuesNonPositive(Map<String, BigDecimal> map) {
+        if (map == null) {
+            return true;
+        }
+        for (BigDecimal p : map.values()) {
+            if (p != null && p.compareTo(BigDecimal.ZERO) > 0) {
+                return false;
+            }
+        }
+        return true;
+    }
 }

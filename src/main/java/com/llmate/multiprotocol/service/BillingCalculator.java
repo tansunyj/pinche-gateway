@@ -64,6 +64,8 @@ public class BillingCalculator {
      * - 维度价无效（0/null/负）→ 兜底同侧主价：输入侧回落 inputPer1m，输出侧回落 outputPer1m，
      *   （缓存命中维度、图文/向量/视频token 子维度均适用），避免「有使用量却按 0 计费」的漏收；
      * - 维度价与同侧主价都无效且该维度有用量 → 抛 PRICE_NOT_CONFIGURED 拒绝计费（不做静默免费）；
+     * - 免费模型（全部价格=0，见 {@link BillingParams#isFreeModel}）在 {@link #calculateCostInUsd}
+     *   顶部整体短路为 0 计费，不进入上述 token 维度判定（预检 validateTokenPrices 已放行）；
      * - 非 token 维度（按次/按秒/按字符）维持原规则：未配置价格（为0/null/负）该维度费用为0。
      * 计算过程（各维度用量×单价+折扣）通过 LogBox.logBillingDetail 完整打印。
      *
@@ -154,6 +156,14 @@ public class BillingCalculator {
      */
     private BigDecimal calculateCostInUsd(String billingMode, UsageData usage, BillingParams params, List<String> details) {
         BigDecimal cost = BigDecimal.ZERO;
+
+        // 免费模型（全部价格=0，见 BillingParams#isFreeModel）：直接 0 计费，不再逐维度判定。
+        // 同时也避免 resolveTokenPrice 在「维度价与同侧主价均≤0 且有用量」时抛 PRICE_NOT_CONFIGURED
+        // （预检 validateTokenPrices 已放行免费模型，这里必须能算出 0 费）。
+        if (params.isFreeModel()) {
+            details.add("免费模型: 全部价格=0，费用=0");
+            return BigDecimal.ZERO;
+        }
 
         switch (billingMode.toLowerCase()) {
             case BusinessConstants.BILLING_MODE_TOKEN -> {
@@ -451,6 +461,8 @@ public class BillingCalculator {
      * - 维度价与同侧主价都无效，且该维度有用量 → 抛 {@link LlmErrorCode#PRICE_NOT_CONFIGURED} 拒绝计费，
      *   避免「有使用量却按 0 计费」的费用缺失（用户确认：全无价格可兜时拒绝而非静默免费）；
      *   无用量（tokens<=0）时不抛，返回 null（由调用方按无用量处理，费用=0）。
+     *
+     * 免费模型（全部价格=0）不会到达本方法：calculateCostInUsd 顶部已整体短路为 0 计费。
      *
      * 应用范围：TOKEN（输入未命中/命中、输出）、IMAGE_TOKEN（图文 4 子维度）、
      * EMBEDDING（向量 3 子维度）、VIDEO_TOKEN（分辨率档位）。
