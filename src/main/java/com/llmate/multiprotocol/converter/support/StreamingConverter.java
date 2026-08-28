@@ -86,9 +86,15 @@ public class StreamingConverter {
                                 .arguments(chunk.getToolCallArgumentsDelta())
                                 .build())
                         .build()));
-            } else if (chunk.getDeltaContent() != null && !chunk.getDeltaContent().isEmpty()) {
+            } else {
                 // 仅在确有文本增量时携带 content；结束 chunk（content 为空串）保持 delta={}，与 OpenAI 规范一致
-                deltaBuilder.content(chunk.getDeltaContent());
+                if (chunk.getDeltaContent() != null && !chunk.getDeltaContent().isEmpty()) {
+                    deltaBuilder.content(chunk.getDeltaContent());
+                }
+                // 推理增量单独输出到 reasoning_content，绝不拼入 content（reasoning_content 是独立字段）
+                if (chunk.getDeltaReasoningContent() != null && !chunk.getDeltaReasoningContent().isEmpty()) {
+                    deltaBuilder.reasoningContent(chunk.getDeltaReasoningContent());
+                }
             }
 
             String finishReason = resolveFinishReason(chunk, toolCallEmitted.get());

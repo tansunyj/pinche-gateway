@@ -16,6 +16,8 @@ public class LlmStreamChunk {
     private boolean isFirstChunk;
     private boolean isFinished;
     private String deltaContent;
+    /** 推理/思考增量（reasoning_content）：与正文 deltaContent 分开存放，下游按协议映射到推理字段（如 OpenAI reasoning_content），不得拼入 content */
+    private String deltaReasoningContent;
 
     // 流式复杂工具调用增量级属性组
     private String toolCallId;

@@ -181,11 +181,13 @@ public class OpenAiFormatConverter {
             if (choice != null && choice.getDelta() != null) {
                 OpenAiDelta delta = choice.getDelta();
 
-                // 优先使用 reasoningContent (DeepSeek/o1 推理内容)，否则使用 content
-                String content = delta.getReasoningContent() != null
-                        ? delta.getReasoningContent()
-                        : delta.getContent();
-                internalChunk.setDeltaContent(content != null ? content : "");
+                // 推理内容与正文分开存放：reasoning_content 增量 → deltaReasoningContent（下游映射到
+                // 推理字段如 reasoning_content），正文增量 → deltaContent。旧实现把 reasoningContent
+                // 优先并入 deltaContent，导致推理被当作正文拼进用户 content（见 StreamingConverter）。
+                if (delta.getReasoningContent() != null) {
+                    internalChunk.setDeltaReasoningContent(delta.getReasoningContent());
+                }
+                internalChunk.setDeltaContent(delta.getContent() != null ? delta.getContent() : "");
 
                 // 处理工具调用增量
                 if (delta.getToolCalls() != null && !delta.getToolCalls().isEmpty()) {
